@@ -7,6 +7,7 @@ network.
 """
 
 import base64
+import json
 import os
 import sys
 import types
@@ -24,6 +25,7 @@ class Message:
     def __init__(self, content=None, role=None, **kw):
         self.content = content
         self.role = role
+        self.tool_calls = kw.get("tool_calls")
 
 
 class Choices:
@@ -200,6 +202,124 @@ class AgyHandlerTest(unittest.TestCase):
                 model="agy",
                 messages=[{"role": "user", "content": "hi"}],
             )
+
+    # --- tool / function calling ----------------------------------------
+    _TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "turn_on",
+                "description": "Turn a device on",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"],
+                },
+            },
+        }
+    ]
+
+    def test_tools_request_maps_structured_tool_calls(self):
+        seen = {}
+
+        def fake_run(base, token, payload, timeout):
+            seen["payload"] = payload
+            return {
+                "ok": True,
+                "agy": {
+                    "status": "SUCCESS",
+                    "structured_output": {
+                        "tool_calls": [{"name": "turn_on", "arguments": {"name": "kitchen light"}}],
+                        "content": "",
+                    },
+                },
+            }
+
+        agy_handler._post_run = fake_run
+        resp = agy_handler.agy_llm.completion(
+            model="agy",
+            messages=[{"role": "user", "content": "turn on the kitchen light"}],
+            optional_params={"tools": self._TOOLS, "tool_choice": "auto"},
+        )
+
+        choice = resp.choices[0]
+        self.assertEqual(choice.finish_reason, "tool_calls")
+        self.assertIsNone(choice.message.content)
+        self.assertEqual(len(choice.message.tool_calls), 1)
+        tc = choice.message.tool_calls[0]
+        self.assertEqual(tc["type"], "function")
+        self.assertEqual(tc["function"]["name"], "turn_on")
+        # arguments are serialized to a JSON string (OpenAI shape)
+        self.assertEqual(json.loads(tc["function"]["arguments"]), {"name": "kitchen light"})
+        # a jsonSchema was sent and the tool catalogue reached the prompt
+        self.assertIn("jsonSchema", seen["payload"])
+        self.assertIn("turn_on", seen["payload"]["prompt"])
+
+    def test_tools_request_without_a_call_returns_content(self):
+        def fake_run(base, token, payload, timeout):
+            return {
+                "ok": True,
+                "agy": {
+                    "status": "SUCCESS",
+                    "structured_output": {"tool_calls": [], "content": "It is sunny."},
+                },
+            }
+
+        agy_handler._post_run = fake_run
+        resp = agy_handler.agy_llm.completion(
+            model="agy",
+            messages=[{"role": "user", "content": "weather?"}],
+            optional_params={"tools": self._TOOLS},
+        )
+        self.assertEqual(resp.choices[0].finish_reason, "stop")
+        self.assertEqual(resp.choices[0].message.content, "It is sunny.")
+        self.assertIsNone(resp.choices[0].message.tool_calls)
+
+    def test_tool_choice_none_disables_the_schema(self):
+        seen = {}
+
+        def fake_run(base, token, payload, timeout):
+            seen["payload"] = payload
+            return {"ok": True, "agy": {"status": "SUCCESS", "response": "plain answer"}}
+
+        agy_handler._post_run = fake_run
+        resp = agy_handler.agy_llm.completion(
+            model="agy",
+            messages=[{"role": "user", "content": "hi"}],
+            optional_params={"tools": self._TOOLS, "tool_choice": "none"},
+        )
+        self.assertNotIn("jsonSchema", seen["payload"])
+        self.assertEqual(resp.choices[0].message.content, "plain answer")
+
+    def test_prompt_renders_prior_tool_calls_and_results(self):
+        seen = {}
+
+        def fake_run(base, token, payload, timeout):
+            seen["payload"] = payload
+            return {
+                "ok": True,
+                "agy": {"status": "SUCCESS", "structured_output": {"tool_calls": [], "content": "done"}},
+            }
+
+        agy_handler._post_run = fake_run
+        agy_handler.agy_llm.completion(
+            model="agy",
+            messages=[
+                {"role": "user", "content": "turn on the light"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"id": "c1", "type": "function", "function": {"name": "turn_on", "arguments": '{"name":"light"}'}}
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "c1", "name": "turn_on", "content": "Success"},
+            ],
+            optional_params={"tools": self._TOOLS},
+        )
+        prompt = seen["payload"]["prompt"]
+        self.assertIn("Assistant called: turn_on", prompt)
+        self.assertIn("Tool result (turn_on): Success", prompt)
 
 
 if __name__ == "__main__":

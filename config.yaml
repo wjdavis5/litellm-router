@@ -30,7 +30,10 @@ litellm_settings:
     - provider: agy
       custom_handler: handlers.agy_handler.agy_llm
   # OTel export + the pre-call routing hook instance
-  callbacks: ["otel", "handlers.routing_hook.hook_instance"]
+  # `otel` (U10) exports TRACES via OTLP — but the lab logging stack is Loki
+  # (logs only, no Tempo/traces backend), so it's disabled until one exists.
+  # Re-add "otel" + set OTEL_ENDPOINT once a traces backend is deployed.
+  callbacks: ["handlers.routing_hook.hook_instance"]
   set_verbose: false
   # model-level fallbacks: agy -> cloud, ollama-local -> agy
   fallbacks:

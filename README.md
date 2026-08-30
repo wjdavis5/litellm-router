@@ -80,12 +80,16 @@ are intended to run on the desktop host (`192.168.0.34`).
 - [`docs/HA-cutover.md`](docs/HA-cutover.md) — runbook to move Home Assistant's
   Assist from the native Ollama integration onto this proxy (not yet applied).
 
+## Capabilities (live-verified 2026-08-30)
+
+Deployed as the `litellm-router` docker container (`:4000`). End-to-end proven
+against live agy: **text**, **vision** (base64 image → `/files` → agy vision),
+and **OpenAI tool / function calling** (via agy's `--json-schema` structured
+output — `tools` in a request → `tool_calls` back, with the multi-turn tool
+result → final-reply loop). See `handlers/agy_handler.py`.
+
 ## Known limitations (accepted)
 
-- Not deployed; the agy contract encoded in `handlers/agy_handler.py` matches
-  the `agy-gateway` README as of 2026-08-30 but has not been live-verified from
-  this repo. Re-check `POST /run` and `POST /files` response shapes before first
-  deploy.
 - The `ensure-running` controller endpoint (`:8765`) is assumed deployed; the
   hook falls back to `cloud` if it is unreachable.
 - Plaintext HTTP on the trusted LAN, single shared master key.

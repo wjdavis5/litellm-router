@@ -6,6 +6,16 @@ uploads any inline base64 images to the gateway's ``POST /files`` endpoint and
 references the stored path in the prompt, then calls ``POST /run`` and maps
 ``agy.response`` back into a ``litellm.ModelResponse``.
 
+**Tool / function calling.** When a request carries ``tools`` (e.g. Home
+Assistant's Assist API), the handler switches on agy's structured-output mode:
+it describes the tools in the prompt and passes a ``jsonSchema`` that forces agy
+to answer with ``{"tool_calls": [...], "content": "..."}``. A non-empty
+``tool_calls`` is mapped to OpenAI ``message.tool_calls`` (finish_reason
+``tool_calls``) so litellm/HA can execute the tool and loop back; otherwise
+``content`` is returned as a normal assistant message. On the follow-up turn the
+prior ``assistant`` tool calls and ``role:"tool"`` results are flattened into
+the prompt so agy has the full context.
+
 HTTP is done through the module-level ``_post_run`` / ``_post_file`` (and async
 ``_apost_run`` / ``_apost_file``) functions so tests can monkeypatch them and
 never touch the network. ``httpx`` is imported lazily inside those functions so
@@ -15,6 +25,7 @@ this module imports cleanly without it installed.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import uuid
 from typing import Any, Callable, Dict, List, Optional
@@ -34,6 +45,33 @@ _MIME_EXT = {
     "image/bmp": "bmp",
     "image/tiff": "tiff",
 }
+
+# Schema forcing agy to emit a tool-call DECISION. Both fields are always
+# present: a non-empty ``tool_calls`` means "call these"; otherwise ``content``
+# is the assistant's text reply. Kept small — the gateway passes it to agy as a
+# single CLI argument (length-capped server-side).
+_TOOL_DECISION_SCHEMA = json.dumps(
+    {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "tool_calls": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "name": {"type": "string"},
+                        "arguments": {"type": "object", "additionalProperties": True},
+                    },
+                    "required": ["name", "arguments"],
+                },
+            },
+            "content": {"type": "string"},
+        },
+        "required": ["tool_calls", "content"],
+    }
+)
 
 
 # --------------------------------------------------------------------------
@@ -146,6 +184,46 @@ def _file_ref_from_response(body: Any, fallback_name: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# tool-calling helpers
+# --------------------------------------------------------------------------
+def _extract_tools(optional_params: Optional[Dict[str, Any]], kwargs: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+    """Return the request's OpenAI ``tools`` list, or None when tool-calling is
+    off. ``tool_choice: "none"`` disables it even when tools are present."""
+    op = optional_params or {}
+    tool_choice = op.get("tool_choice", kwargs.get("tool_choice"))
+    if tool_choice == "none":
+        return None
+    tools = op.get("tools")
+    if tools is None:
+        tools = kwargs.get("tools")
+    if not tools:
+        return None
+    return tools
+
+
+def _tools_block(tools: List[Dict[str, Any]]) -> str:
+    """Render the tool catalogue + calling instructions for the prompt."""
+    lines = [
+        'You can call tools. To use one or more, add them to "tool_calls" — each '
+        'with the exact tool "name" and an "arguments" object that satisfies that '
+        'tool\'s parameters. If no tool is needed, use an empty "tool_calls" array '
+        'and put your reply in "content". Respond ONLY with JSON matching the '
+        "required schema.",
+        "",
+        "Available tools:",
+    ]
+    for t in tools or []:
+        fn = t.get("function", t) if isinstance(t, dict) else {}
+        name = fn.get("name", "")
+        desc = fn.get("description", "")
+        params = fn.get("parameters")
+        lines.append(f"- {name}: {desc}")
+        if params:
+            lines.append(f"  parameters (JSON schema): {json.dumps(params)}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
 # prompt building
 # --------------------------------------------------------------------------
 def _decode_data_url(url: str) -> Optional[tuple]:
@@ -207,13 +285,46 @@ def _flatten_content(content: Any, upload: Callable[[bytes, str], str]) -> str:
     return "\n".join(p for p in pieces if p)
 
 
-def _build_prompt(messages: List[Dict[str, Any]], upload: Callable[[bytes, str], str]) -> str:
-    """Flatten messages into one prompt: system turns first, then the dialogue."""
+def _describe_tool_calls(tool_calls: Any) -> str:
+    """Render an assistant message's tool_calls into readable prompt text."""
+    descs: List[str] = []
+    for tc in tool_calls or []:
+        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+        name = fn.get("name", "")
+        args = fn.get("arguments", "")
+        descs.append(f"{name}({args})")
+    return "Assistant called: " + ", ".join(descs)
+
+
+def _build_prompt(
+    messages: List[Dict[str, Any]],
+    upload: Callable[[bytes, str], str],
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """Flatten messages into one prompt: system turns first, then the dialogue.
+
+    Also renders assistant ``tool_calls`` and ``role:"tool"`` results so a
+    follow-up (post-tool-execution) turn keeps full context.
+    """
     system_parts: List[str] = []
     turns: List[str] = []
     for msg in messages or []:
         role = (msg.get("role") or "user").lower()
         text = _flatten_content(msg.get("content"), upload)
+
+        if role == "tool":
+            name = msg.get("name") or msg.get("tool_call_id") or "tool"
+            turns.append(f"Tool result ({name}): {text}")
+            continue
+
+        tool_calls = msg.get("tool_calls")
+        if role == "assistant" and tool_calls:
+            line = _describe_tool_calls(tool_calls)
+            if text:
+                line = f"{text}\n{line}"
+            turns.append(line)
+            continue
+
         if not text:
             continue
         if role == "system":
@@ -223,6 +334,10 @@ def _build_prompt(messages: List[Dict[str, Any]], upload: Callable[[bytes, str],
         else:
             turns.append(f"User: {text}")
 
+    # Tool instructions lead the system block so they frame the whole exchange.
+    if tools:
+        system_parts.insert(0, _tools_block(tools))
+
     sections: List[str] = []
     if system_parts:
         sections.append("System:\n" + "\n".join(system_parts))
@@ -231,18 +346,7 @@ def _build_prompt(messages: List[Dict[str, Any]], upload: Callable[[bytes, str],
     return "\n\n".join(sections)
 
 
-def _map_response(model: Optional[str], body: Dict[str, Any]) -> "litellm.ModelResponse":
-    """Map a gateway /run success body into a litellm.ModelResponse."""
-    agy = body.get("agy") or {}
-    text = agy.get("response", "") or ""
-
-    model_response = litellm.ModelResponse()
-    message = litellm.Message(content=text, role="assistant")
-    choice = litellm.Choices(index=0, message=message, finish_reason="stop")
-    model_response.choices = [choice]
-    if model:
-        model_response.model = model
-
+def _attach_usage(model_response: "litellm.ModelResponse", agy: Dict[str, Any]) -> None:
     usage = agy.get("usage")
     if isinstance(usage, dict):
         try:
@@ -253,7 +357,63 @@ def _map_response(model: Optional[str], body: Dict[str, Any]) -> "litellm.ModelR
             )
         except Exception:
             pass
+
+
+def _text_model_response(model: Optional[str], text: str, agy: Dict[str, Any]) -> "litellm.ModelResponse":
+    model_response = litellm.ModelResponse()
+    message = litellm.Message(content=text, role="assistant")
+    choice = litellm.Choices(index=0, message=message, finish_reason="stop")
+    model_response.choices = [choice]
+    if model:
+        model_response.model = model
+    _attach_usage(model_response, agy)
     return model_response
+
+
+def _map_response(model: Optional[str], body: Dict[str, Any]) -> "litellm.ModelResponse":
+    """Map a gateway /run success body (no tools) into a litellm.ModelResponse."""
+    agy = body.get("agy") or {}
+    text = agy.get("response", "") or ""
+    return _text_model_response(model, text, agy)
+
+
+def _map_tool_response(model: Optional[str], body: Dict[str, Any]) -> "litellm.ModelResponse":
+    """Map a tool-mode /run body into a ModelResponse, preferring the trusted
+    ``structured_output``. Non-empty tool_calls -> OpenAI tool_calls; otherwise
+    the ``content`` field (or a fallback to ``response``) is a text reply."""
+    agy = body.get("agy") or {}
+    so = agy.get("structured_output")
+    if isinstance(so, dict):
+        raw_calls = so.get("tool_calls") or []
+        if raw_calls:
+            tool_calls = []
+            for tc in raw_calls:
+                if not isinstance(tc, dict):
+                    continue
+                name = tc.get("name", "")
+                args = tc.get("arguments", {})
+                if not isinstance(args, str):
+                    args = json.dumps(args if args is not None else {})
+                tool_calls.append(
+                    {
+                        "id": "call_" + uuid.uuid4().hex[:24],
+                        "type": "function",
+                        "function": {"name": name, "arguments": args},
+                    }
+                )
+            if tool_calls:
+                model_response = litellm.ModelResponse()
+                message = litellm.Message(role="assistant", content=None, tool_calls=tool_calls)
+                choice = litellm.Choices(index=0, message=message, finish_reason="tool_calls")
+                model_response.choices = [choice]
+                if model:
+                    model_response.model = model
+                _attach_usage(model_response, agy)
+                return model_response
+        # structured output present but no tool call -> its content is the reply
+        return _text_model_response(model, so.get("content", "") or "", agy)
+    # no structured output (agy didn't conform) -> fall back to plain text
+    return _text_model_response(model, agy.get("response", "") or "", agy)
 
 
 def _resolve_effort(optional_params: Optional[Dict[str, Any]]) -> str:
@@ -262,6 +422,22 @@ def _resolve_effort(optional_params: Optional[Dict[str, Any]]) -> str:
         if eff in ("low", "medium", "high"):
             return eff
     return "high"
+
+
+def _build_payload(prompt: str, optional_params: Dict[str, Any], timeout: float, tools: Optional[list]) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "prompt": prompt,
+        "effort": _resolve_effort(optional_params),
+        "outputFormat": "json",
+        # Bound agy to the same budget as our client: without this agy runs to
+        # its own default and keeps a concurrency slot held after we've already
+        # timed out (agy has no cancellation).
+        "timeoutMs": int(timeout * 1000),
+    }
+    if tools:
+        # Force a structured tool-call decision agy can't wander away from.
+        payload["jsonSchema"] = _TOOL_DECISION_SCHEMA
+    return payload
 
 
 # --------------------------------------------------------------------------
@@ -282,17 +458,10 @@ class MyAgy(litellm.CustomLLM):
             name = f"{uuid.uuid4().hex}.{ext}"
             return _post_file(base, token, name, raw)
 
-        prompt = _build_prompt(messages, upload)
+        tools = _extract_tools(optional_params, kwargs)
+        prompt = _build_prompt(messages, upload, tools=tools)
         timeout = float(kwargs.get("timeout") or 120.0)
-        payload = {
-            "prompt": prompt,
-            "effort": _resolve_effort(optional_params),
-            "outputFormat": "json",
-            # Bound agy to the same budget as our client: without this agy runs to
-            # its own 300s default and keeps a concurrency slot held after we've
-            # already timed out (agy has no cancellation).
-            "timeoutMs": int(timeout * 1000),
-        }
+        payload = _build_payload(prompt, optional_params, timeout, tools)
 
         try:
             body = _post_run(base, token, payload, timeout)
@@ -302,7 +471,7 @@ class MyAgy(litellm.CustomLLM):
         if not isinstance(body, dict) or not body.get("ok"):
             raise _provider_error(model, f"agy /run returned an error body: {str(body)[:200]}")
 
-        return _map_response(model, body)
+        return _map_tool_response(model, body) if tools else _map_response(model, body)
 
     async def acompletion(self, *args, **kwargs) -> "litellm.ModelResponse":
         model = kwargs.get("model")
@@ -324,14 +493,10 @@ class MyAgy(litellm.CustomLLM):
             except StopIteration:
                 return "unknown"
 
-        prompt = _build_prompt(messages, upload)
+        tools = _extract_tools(optional_params, kwargs)
+        prompt = _build_prompt(messages, upload, tools=tools)
         timeout = float(kwargs.get("timeout") or 120.0)
-        payload = {
-            "prompt": prompt,
-            "effort": _resolve_effort(optional_params),
-            "outputFormat": "json",
-            "timeoutMs": int(timeout * 1000),  # keep agy's budget == our client budget
-        }
+        payload = _build_payload(prompt, optional_params, timeout, tools)
 
         try:
             body = await _apost_run(base, token, payload, timeout)
@@ -341,7 +506,7 @@ class MyAgy(litellm.CustomLLM):
         if not isinstance(body, dict) or not body.get("ok"):
             raise _provider_error(model, f"agy /run returned an error body: {str(body)[:200]}")
 
-        return _map_response(model, body)
+        return _map_tool_response(model, body) if tools else _map_response(model, body)
 
 
 async def _preupload_images(base: str, token: str, messages: List[Dict[str, Any]], out: List[str]) -> None:
