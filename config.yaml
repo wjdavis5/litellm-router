@@ -1,0 +1,45 @@
+# litellm proxy config — DB-less. Fronts agy (primary), on-demand local ollama,
+# and an optional cloud fallback. Loaded by the container at /app/config.yaml.
+#
+# Routing is steered by handlers/routing_hook.py (registered under
+# litellm_settings.callbacks): by default every request is redirected to `agy`;
+# an explicit `ollama-local` request triggers on-demand ollama warm-up via the
+# deployed controller, falling back to `cloud` if warm-up fails.
+
+model_list:
+  # primary: custom provider -> agy gateway (see handlers/agy_handler.py)
+  - model_name: agy
+    litellm_params:
+      model: "agy/default"
+
+  # on-demand local model served by ollama on the desktop host
+  - model_name: ollama-local
+    litellm_params:
+      model: "ollama_chat/qwen3-vl:8b"
+      api_base: "http://host.docker.internal:11434"
+
+  # optional cloud fallback — keyless is OK: unused until ANTHROPIC_API_KEY is set
+  - model_name: cloud
+    litellm_params:
+      model: "anthropic/claude-sonnet-4-5"
+      api_key: "os.environ/ANTHROPIC_API_KEY"
+
+litellm_settings:
+  # register the agy CustomLLM instance for the `agy/*` provider
+  custom_provider_map:
+    - provider: agy
+      custom_handler: handlers.agy_handler.agy_llm
+  # OTel export + the pre-call routing hook instance
+  callbacks: ["otel", "handlers.routing_hook.hook_instance"]
+  set_verbose: false
+  # model-level fallbacks: agy -> cloud, ollama-local -> agy
+  fallbacks:
+    - agy: ["cloud"]
+    - ollama-local: ["agy"]
+  num_retries: 2
+  request_timeout: 120
+
+router_settings:
+  cooldown_time: 30
+  allowed_fails: 3
+  routing_strategy: simple-shuffle
