@@ -186,6 +186,32 @@ def _file_ref_from_response(body: Any, fallback_name: str) -> str:
 # --------------------------------------------------------------------------
 # tool-calling helpers
 # --------------------------------------------------------------------------
+def _extract_response_format(optional_params: Optional[Dict[str, Any]], kwargs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return the request's ``response_format`` (OpenAI structured output), used
+    by e.g. HA AI Tasks. None when absent."""
+    op = optional_params or {}
+    rf = op.get("response_format")
+    if rf is None:
+        rf = kwargs.get("response_format")
+    return rf if isinstance(rf, dict) else None
+
+
+def _schema_from_response_format(rf: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Map an OpenAI ``response_format`` to an agy ``jsonSchema`` string."""
+    if not isinstance(rf, dict):
+        return None
+    rtype = rf.get("type")
+    if rtype == "json_schema":
+        js = rf.get("json_schema") or {}
+        schema = js.get("schema") if isinstance(js, dict) else None
+        if schema is None:
+            schema = js if isinstance(js, dict) else {"type": "object"}
+        return json.dumps(schema)
+    if rtype == "json_object":
+        return json.dumps({"type": "object"})
+    return None
+
+
 def _extract_tools(optional_params: Optional[Dict[str, Any]], kwargs: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
     """Return the request's OpenAI ``tools`` list, or None when tool-calling is
     off. ``tool_choice: "none"`` disables it even when tools are present."""
@@ -424,7 +450,13 @@ def _resolve_effort(optional_params: Optional[Dict[str, Any]]) -> str:
     return "high"
 
 
-def _build_payload(prompt: str, optional_params: Dict[str, Any], timeout: float, tools: Optional[list]) -> Dict[str, Any]:
+def _build_payload(
+    prompt: str,
+    optional_params: Dict[str, Any],
+    timeout: float,
+    tools: Optional[list],
+    response_format: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "prompt": prompt,
         "effort": _resolve_effort(optional_params),
@@ -437,7 +469,24 @@ def _build_payload(prompt: str, optional_params: Dict[str, Any], timeout: float,
     if tools:
         # Force a structured tool-call decision agy can't wander away from.
         payload["jsonSchema"] = _TOOL_DECISION_SCHEMA
+    else:
+        # A response_format (e.g. HA AI Task) forces agy's structured output to
+        # the caller's schema. Tools take precedence (their schema is the slot).
+        schema = _schema_from_response_format(response_format)
+        if schema is not None:
+            payload["jsonSchema"] = schema
     return payload
+
+
+def _map_structured_content_response(model: Optional[str], body: Dict[str, Any]) -> "litellm.ModelResponse":
+    """response_format path: return agy's ``structured_output`` as a JSON-string
+    message content (the OpenAI convention for structured output)."""
+    agy = body.get("agy") or {}
+    so = agy.get("structured_output")
+    if so is not None:
+        text = so if isinstance(so, str) else json.dumps(so)
+        return _text_model_response(model, text, agy)
+    return _text_model_response(model, agy.get("response", "") or "", agy)
 
 
 # --------------------------------------------------------------------------
@@ -459,9 +508,10 @@ class MyAgy(litellm.CustomLLM):
             return _post_file(base, token, name, raw)
 
         tools = _extract_tools(optional_params, kwargs)
+        response_format = _extract_response_format(optional_params, kwargs)
         prompt = _build_prompt(messages, upload, tools=tools)
         timeout = float(kwargs.get("timeout") or 120.0)
-        payload = _build_payload(prompt, optional_params, timeout, tools)
+        payload = _build_payload(prompt, optional_params, timeout, tools, response_format)
 
         try:
             body = _post_run(base, token, payload, timeout)
@@ -471,7 +521,11 @@ class MyAgy(litellm.CustomLLM):
         if not isinstance(body, dict) or not body.get("ok"):
             raise _provider_error(model, f"agy /run returned an error body: {str(body)[:200]}")
 
-        return _map_tool_response(model, body) if tools else _map_response(model, body)
+        if tools:
+            return _map_tool_response(model, body)
+        if response_format is not None:
+            return _map_structured_content_response(model, body)
+        return _map_response(model, body)
 
     async def acompletion(self, *args, **kwargs) -> "litellm.ModelResponse":
         model = kwargs.get("model")
@@ -494,9 +548,10 @@ class MyAgy(litellm.CustomLLM):
                 return "unknown"
 
         tools = _extract_tools(optional_params, kwargs)
+        response_format = _extract_response_format(optional_params, kwargs)
         prompt = _build_prompt(messages, upload, tools=tools)
         timeout = float(kwargs.get("timeout") or 120.0)
-        payload = _build_payload(prompt, optional_params, timeout, tools)
+        payload = _build_payload(prompt, optional_params, timeout, tools, response_format)
 
         try:
             body = await _apost_run(base, token, payload, timeout)
@@ -506,7 +561,11 @@ class MyAgy(litellm.CustomLLM):
         if not isinstance(body, dict) or not body.get("ok"):
             raise _provider_error(model, f"agy /run returned an error body: {str(body)[:200]}")
 
-        return _map_tool_response(model, body) if tools else _map_response(model, body)
+        if tools:
+            return _map_tool_response(model, body)
+        if response_format is not None:
+            return _map_structured_content_response(model, body)
+        return _map_response(model, body)
 
 
 async def _preupload_images(base: str, token: str, messages: List[Dict[str, Any]], out: List[str]) -> None:

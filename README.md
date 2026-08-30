@@ -88,6 +88,26 @@ and **OpenAI tool / function calling** (via agy's `--json-schema` structured
 output — `tools` in a request → `tool_calls` back, with the multi-turn tool
 result → final-reply loop). See `handlers/agy_handler.py`.
 
+## Ollama-shim — agy as a native HA AI Task backend (`:11435`)
+
+HA's native `litellm` integration is conversation-only (no AI Task). HA's native
+**Ollama** integration, by contrast, supports conversation **and** AI Task **and**
+vision. So `ollama-shim/` exposes an Ollama-native API (`/api/version`,
+`/api/tags`, `/api/show`, `/api/chat`) that translates to litellm (`model=agy`) —
+letting HA's built-in Ollama integration use agy as a first-class backend.
+
+- Advertises capabilities `completion, vision, tools` so HA enables all features.
+- `/api/chat` maps Ollama → OpenAI: message `images[]` → data-URL image parts,
+  `format` (schema or `"json"`) → `response_format`, `tools` pass through; the
+  OpenAI reply (content, `tool_calls`) is mapped back to Ollama shape.
+- Requires the agy handler's `response_format` support (structured output) — the
+  AI Task path. Live-verified: a vision request with a `format` schema returned
+  schema-matched JSON describing the image.
+
+**HA setup:** Settings → Devices & Services → **Ollama** → Add service →
+URL `http://192.168.0.34:11435` → then Add AI task / conversation agent on the
+`agy` model. (Keep the existing `:11434` Ollama service for local qwen3-vl.)
+
 ## Known limitations (accepted)
 
 - The `ensure-running` controller endpoint (`:8765`) is assumed deployed; the

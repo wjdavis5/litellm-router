@@ -2,7 +2,7 @@
 # Start:  docker compose up -d      Logs:  docker compose logs -f
 services:
   litellm:
-    image: docker.litellm.ai/berriai/litellm:main-stable
+    image: ghcr.io/berriai/litellm:main-stable
     container_name: litellm-router
     restart: unless-stopped
     ports:
@@ -18,3 +18,25 @@ services:
     # resolve on Linux hosts too
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+  # Ollama-API shim so HA's native Ollama integration can use agy as a
+  # first-class AI Task + conversation backend (vision included). Translates
+  # the Ollama API to litellm's OpenAI API (model=agy). Point a second HA
+  # Ollama service at http://<desktop>:11435.
+  ollama-shim:
+    image: node:22-alpine
+    container_name: litellm-ollama-shim
+    restart: unless-stopped
+    ports:
+      - "11435:11435"
+    working_dir: /app
+    command: ["node", "server.mjs"]
+    volumes:
+      - ./ollama-shim:/app:ro
+    environment:
+      - LITELLM_BASE=http://litellm:4000
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
+      - AGY_MODEL=agy
+      - SHIM_PORT=11435
+    depends_on:
+      - litellm

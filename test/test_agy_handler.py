@@ -321,6 +321,39 @@ class AgyHandlerTest(unittest.TestCase):
         self.assertIn("Assistant called: turn_on", prompt)
         self.assertIn("Tool result (turn_on): Success", prompt)
 
+    def test_response_format_json_schema_returns_structured_content(self):
+        seen = {}
+
+        def fake_run(base, token, payload, timeout):
+            seen["payload"] = payload
+            return {
+                "ok": True,
+                "agy": {"status": "SUCCESS", "structured_output": {"summary": "a cat", "count": 1}},
+            }
+
+        agy_handler._post_run = fake_run
+        resp = agy_handler.agy_llm.completion(
+            model="agy",
+            messages=[{"role": "user", "content": "describe the scene"}],
+            optional_params={
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "scene",
+                        "schema": {
+                            "type": "object",
+                            "properties": {"summary": {"type": "string"}, "count": {"type": "integer"}},
+                        },
+                    },
+                }
+            },
+        )
+        # the schema was forwarded to agy as jsonSchema ...
+        self.assertIn("jsonSchema", seen["payload"])
+        self.assertIn("summary", seen["payload"]["jsonSchema"])
+        # ... and agy's structured_output is returned as JSON-string content
+        self.assertEqual(json.loads(resp.choices[0].message.content), {"summary": "a cat", "count": 1})
+
 
 if __name__ == "__main__":
     unittest.main()
