@@ -89,3 +89,11 @@ are intended to run on the desktop host (`192.168.0.34`).
 - The `ensure-running` controller endpoint (`:8765`) is assumed deployed; the
   hook falls back to `cloud` if it is unreachable.
 - Plaintext HTTP on the trusted LAN, single shared master key.
+
+## Known limitations (verify at the supervised go-live)
+
+- **No streaming to agy.** The agy handler implements `completion`/`acompletion` only; a `stream:true` request routed to `agy` errors and falls back to `cloud`. HA's Extended-OpenAI-Conversation path is non-streaming — confirm at smoke-test.
+- **Confirm agy→cloud fallback actually fires** (not a loop): the routing hook rewrites non-ollama models to `agy`, and `cloud` is reached only via litellm's internal `agy→cloud` fallback. litellm runs `async_pre_call_hook` once at the proxy layer before router fallbacks, so this is expected-safe — verify by forcing an agy failure.
+- **Coalescing assumes one uvicorn worker + in-memory DualCache** (the shipped docker-compose). With `>1` worker or a Redis-backed cache the "exactly one ensure-running POST" invariant weakens to one-per-worker.
+- **Remote http(s) image URLs are passed as text, not fetched** — agy (headless) won't retrieve them; use base64 data URLs for vision.
+- **agy contract** (`/run`, `/files`→`file.containerPath`) verified against the live openapi 2026-08-30; re-verify if agy-gateway changes.

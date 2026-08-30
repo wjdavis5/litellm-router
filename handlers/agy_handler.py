@@ -194,10 +194,12 @@ def _flatten_content(content: Any, upload: Callable[[bytes, str], str]) -> str:
                 ext = _MIME_EXT.get(mime.lower(), "bin")
                 ref = upload(raw, ext)
                 pieces.append(f"[image: {ref}]")
-            elif url:
+            elif url and not url.startswith("data:"):
                 # remote http(s) image: include the URL in the prompt text,
                 # do not download it in this unit
                 pieces.append(f"[image: {url}]")
+            # a data: URL that failed to decode is DROPPED — never inline the raw
+            # base64 blob (it would blow agy's 100k-char prompt cap / inject garbage)
         else:
             # unknown part type: best-effort include any text field
             if "text" in part:
@@ -281,20 +283,24 @@ class MyAgy(litellm.CustomLLM):
             return _post_file(base, token, name, raw)
 
         prompt = _build_prompt(messages, upload)
+        timeout = float(kwargs.get("timeout") or 120.0)
         payload = {
             "prompt": prompt,
             "effort": _resolve_effort(optional_params),
             "outputFormat": "json",
+            # Bound agy to the same budget as our client: without this agy runs to
+            # its own 300s default and keeps a concurrency slot held after we've
+            # already timed out (agy has no cancellation).
+            "timeoutMs": int(timeout * 1000),
         }
-        timeout = kwargs.get("timeout") or 120.0
 
         try:
-            body = _post_run(base, token, payload, float(timeout))
+            body = _post_run(base, token, payload, timeout)
         except Exception as exc:  # network / non-2xx
             raise _provider_error(model, f"agy /run request failed: {exc}") from exc
 
         if not isinstance(body, dict) or not body.get("ok"):
-            raise _provider_error(model, f"agy /run returned an error body: {body!r}")
+            raise _provider_error(model, f"agy /run returned an error body: {str(body)[:200]}")
 
         return _map_response(model, body)
 
@@ -319,20 +325,21 @@ class MyAgy(litellm.CustomLLM):
                 return "unknown"
 
         prompt = _build_prompt(messages, upload)
+        timeout = float(kwargs.get("timeout") or 120.0)
         payload = {
             "prompt": prompt,
             "effort": _resolve_effort(optional_params),
             "outputFormat": "json",
+            "timeoutMs": int(timeout * 1000),  # keep agy's budget == our client budget
         }
-        timeout = kwargs.get("timeout") or 120.0
 
         try:
-            body = await _apost_run(base, token, payload, float(timeout))
+            body = await _apost_run(base, token, payload, timeout)
         except Exception as exc:
             raise _provider_error(model, f"agy /run request failed: {exc}") from exc
 
         if not isinstance(body, dict) or not body.get("ok"):
-            raise _provider_error(model, f"agy /run returned an error body: {body!r}")
+            raise _provider_error(model, f"agy /run returned an error body: {str(body)[:200]}")
 
         return _map_response(model, body)
 
