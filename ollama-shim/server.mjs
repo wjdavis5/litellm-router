@@ -194,9 +194,54 @@ async function handleChat(req, res, body) {
   );
 }
 
+// /api/generate — Ollama's single-prompt endpoint (used by imageAnalysis'
+// pyproc VLM: {model, prompt, images:[b64], options} -> {response}).
+async function handleGenerate(req, res, body) {
+  const prompt = body.prompt || "";
+  const images = Array.isArray(body.images) ? body.images : [];
+  let content;
+  if (images.length > 0) {
+    content = [{ type: "text", text: prompt }];
+    for (const img of images) {
+      const b64 = typeof img === "string" ? img : "";
+      content.push({ type: "image_url", image_url: { url: `data:${mimeFromB64(b64)};base64,${b64}` } });
+    }
+  } else {
+    content = prompt;
+  }
+  const oai = { model: AGY_MODEL, messages: [{ role: "user", content }], stream: false };
+  const rf = toResponseFormat(body.format);
+  if (rf) oai.response_format = rf;
+  const opts = body.options || {};
+  if (typeof opts.temperature === "number") oai.temperature = opts.temperature;
+
+  const { status, json, text } = await callLiteLLM(oai);
+  if (status < 200 || status >= 300 || !json || !json.choices) {
+    log("generate: litellm error", status, text.slice(0, 200));
+    return send(res, 502, { error: `litellm error ${status}: ${text.slice(0, 200)}` });
+  }
+  const responseText = json.choices[0]?.message?.content ?? "";
+  const created_at = new Date().toISOString();
+  const usage = json.usage || {};
+  const stats = {
+    total_duration: 0,
+    load_duration: 0,
+    prompt_eval_count: usage.prompt_tokens || 0,
+    eval_count: usage.completion_tokens || 0,
+  };
+  if (body.stream === false) {
+    return send(res, 200, { model: AGY_MODEL, created_at, response: responseText, done: true, done_reason: "stop", ...stats });
+  }
+  res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+  res.write(JSON.stringify({ model: AGY_MODEL, created_at, response: responseText, done: false }) + "\n");
+  res.end(JSON.stringify({ model: AGY_MODEL, created_at, response: "", done: true, done_reason: "stop", ...stats }) + "\n");
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, "http://localhost");
   const path = url.pathname;
+  const t0 = Date.now();
+  res.on("finish", () => log(req.method, path, res.statusCode, `${Date.now() - t0}ms`));
   try {
     if (req.method === "GET" && (path === "/" || path === "/api/version")) {
       return send(res, 200, path === "/" ? "Ollama is running" : { version: VERSION });
@@ -224,6 +269,10 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && path === "/api/chat") {
       const b = await readBody(req);
       return handleChat(req, res, b);
+    }
+    if (req.method === "POST" && path === "/api/generate") {
+      const b = await readBody(req);
+      return handleGenerate(req, res, b);
     }
     return send(res, 404, { error: `unsupported: ${req.method} ${path}` });
   } catch (err) {
