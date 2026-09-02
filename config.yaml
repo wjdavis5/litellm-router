@@ -18,6 +18,16 @@ model_list:
       model: "ollama_chat/qwen3-vl:8b"
       api_base: "http://host.docker.internal:11434"
 
+  # cli-gateways (LXC 108/109): opencode + claude-code as HTTP backends
+  # (see handlers/cli_gateway_handler.py; text-only, no tools/images)
+  - model_name: opencode
+    litellm_params:
+      model: "opencode/default"
+
+  - model_name: claude-code
+    litellm_params:
+      model: "claudecode/default"
+
   # optional cloud fallback — keyless is OK: unused until ANTHROPIC_API_KEY is set
   - model_name: cloud
     litellm_params:
@@ -25,20 +35,26 @@ model_list:
       api_key: "os.environ/ANTHROPIC_API_KEY"
 
 litellm_settings:
-  # register the agy CustomLLM instance for the `agy/*` provider
+  # register the CustomLLM instances for the custom providers
   custom_provider_map:
     - provider: agy
       custom_handler: handlers.agy_handler.agy_llm
+    - provider: opencode
+      custom_handler: handlers.opencode_handler.opencode_llm
+    - provider: claudecode
+      custom_handler: handlers.claudecode_handler.claudecode_llm
   # OTel export + the pre-call routing hook instance
   # `otel` (U10) exports TRACES via OTLP — but the lab logging stack is Loki
   # (logs only, no Tempo/traces backend), so it's disabled until one exists.
   # Re-add "otel" + set OTEL_ENDPOINT once a traces backend is deployed.
   callbacks: ["handlers.routing_hook.hook_instance"]
   set_verbose: false
-  # model-level fallbacks: agy -> cloud, ollama-local -> agy
+  # model-level fallbacks: agy -> cloud, ollama-local -> agy, cli-gateways -> cloud
   fallbacks:
     - agy: ["cloud"]
     - ollama-local: ["agy"]
+    - opencode: ["cloud"]
+    - claude-code: ["cloud"]
   num_retries: 2
   request_timeout: 120
 

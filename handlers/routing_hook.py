@@ -42,6 +42,11 @@ _COMPLETION_CALL_TYPES = {
 # the agy redirect).
 _OLLAMA_MODELS = {"ollama-local"}
 
+# models that pass through untouched: the caller named a real route the lab
+# serves directly. Everything else (unknown names, aliases) still defaults to
+# agy. The cli-gateways models MUST be here or the hook silently hijacks them.
+_PASSTHROUGH_MODELS = {"agy", "opencode", "claude-code"}
+
 
 def _controller_url() -> str:
     return os.environ.get("CONTROLLER_URL", DEFAULT_CONTROLLER_URL).rstrip("/")
@@ -120,8 +125,9 @@ class RouterHook(CustomLogger):
         model = data.get("model")
 
         if not _is_ollama_target(model):
-            # default: send everything to agy unless already agy
-            if model != "agy":
+            # default: send everything to agy unless the caller named a
+            # directly-served route (agy itself or one of the cli-gateways)
+            if model not in _PASSTHROUGH_MODELS:
                 data["model"] = "agy"
             return data
 

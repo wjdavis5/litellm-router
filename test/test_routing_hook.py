@@ -68,6 +68,19 @@ class RoutingHookTest(unittest.IsolatedAsyncioTestCase):
         out = await hook.async_pre_call_hook(None, FakeCache(), data, "completion")
         self.assertEqual(out["model"], "agy")
 
+    async def test_cli_gateway_models_pass_through_untouched(self):
+        hook = routing_hook.RouterHook()
+        for name in ("opencode", "claude-code", "agy"):
+            data = {"model": name, "messages": []}
+            out = await hook.async_pre_call_hook(None, FakeCache(), data, "completion")
+            self.assertEqual(out["model"], name, name)
+
+    async def test_unknown_models_still_rewritten_to_agy(self):
+        hook = routing_hook.RouterHook()
+        data = {"model": "gpt-5.6", "messages": []}
+        out = await hook.async_pre_call_hook(None, FakeCache(), data, "completion")
+        self.assertEqual(out["model"], "agy")
+
     async def test_ensure_running_called_once_under_concurrency(self):
         counter = {"n": 0}
 
