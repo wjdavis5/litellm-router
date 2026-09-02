@@ -207,6 +207,32 @@ class CliGatewayHandlerTest(unittest.TestCase):
         )
         self.assertEqual(seen["payload"]["model"], "opencode/mimo-v2.5-free")
 
+    def test_async_gateway_failure_raises_provider_error(self):
+        orig = cgh._apost_run
+
+        async def fake_apost(base, token, payload, timeout):
+            raise RuntimeError("async connect timeout")
+
+        cgh._apost_run = fake_apost
+        try:
+            with self.assertRaises(_APIConnectionError):
+                asyncio.run(opencode_llm.acompletion(model="m", messages=[{"role": "user", "content": "x"}]))
+        finally:
+            cgh._apost_run = orig
+
+    def test_http_timeout_pads_past_gateway_budget(self):
+        seen = {}
+
+        def fake_post(base, token, payload, timeout):
+            seen.update(payload_timeout_ms=payload["timeoutMs"], http_timeout=timeout)
+            return dict(GATEWAY_OK)
+
+        cgh._post_run = fake_post
+        opencode_llm.completion(model="m", messages=[{"role": "user", "content": "x"}], timeout=30)
+        # gateway gets the true 30s budget; httpx waits longer so the 504 lands first
+        self.assertEqual(seen["payload_timeout_ms"], 30000)
+        self.assertGreater(seen["http_timeout"], 30.0)
+
     def test_async_path_uses_apost_run(self):
         orig = cgh._apost_run
         seen = {}

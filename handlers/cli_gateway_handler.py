@@ -114,8 +114,10 @@ def _flatten_content(content: Any) -> str:
 
 def _build_prompt(messages: List[Dict[str, Any]]) -> str:
     """Flatten messages into one prompt: system turns first, then dialogue.
-    Assistant tool_calls / role:"tool" results are rendered as plain text so a
-    post-tool-execution transcript still reads coherently."""
+    role:"tool" results are rendered as plain text so a post-tool-execution
+    transcript still reads coherently. (These gateways reject requests that
+    carry `tools`, so no assistant tool_calls turn originates here — but a
+    replayed transcript can still contain tool results.)"""
     system_parts: List[str] = []
     turns: List[str] = []
     for msg in messages or []:
@@ -203,13 +205,17 @@ class CliGatewayLLM(litellm.CustomLLM):
             raise _provider_error(self.provider, model, str(exc)) from exc
 
         timeout = float(kwargs.get("timeout") or 120.0)
+        # The gateway gets the true budget; the httpx client waits a few seconds
+        # LONGER so the gateway's own SIGKILL+504 lands first — otherwise the
+        # client always times out before the typed gateway error can return.
+        http_timeout = timeout + 5.0
         payload: Dict[str, Any] = {"prompt": prompt, "timeoutMs": int(timeout * 1000)}
         # Per-request model override via extra_body (optional; the gateway's
         # GW_DEFAULT_MODEL rules otherwise).
         requested = optional_params.get("model")
         if isinstance(requested, str) and requested.strip():
             payload["model"] = requested
-        return model, payload, timeout
+        return model, payload, http_timeout
 
     def _finish(self, model: Optional[str], body: Any) -> "litellm.ModelResponse":
         if not isinstance(body, dict) or not body.get("ok"):
