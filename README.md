@@ -9,9 +9,17 @@ LLM router: the litellm layer plus its two custom Python handlers.
 
 ## Status + deployment
 
-**Dev project — not deployed.** Intended to run as a Docker container on this
-desktop host (`192.168.0.34`), listening on `:4000`, LAN-only (no tunnel).
-Nothing is running yet and no live agy/HA calls have been made from this repo.
+**Deployed** — running as a k3s Deployment (`litellm` + `ollama-shim`) on
+`pve01-services` (`192.168.0.140`, fixed DHCP reservation), not this
+`docker-compose.yml` anymore. Migrated off Docker Desktop 2026-09-09 — see
+`wjdavis5/CommandCenter`'s `repos/k3s-cluster/litellm-router/` for the actual
+manifests (this repo's `config.yaml`/`handlers/`/`ollama-shim/` are the
+canonical source, copied there) and `docs/node-inventory.md`'s "Docker
+Desktop pivot" section for what the move involved. `docker-compose.yml` is
+kept for local dev/testing only — it is NOT what's live. LAN-only (no
+tunnel), `:4000` + shim `:11435`, listening on `192.168.0.140` now instead of
+`192.168.0.34`. HA's `litellm` + second `ollama` integration entries and
+every other consumer were repointed at the new address.
 
 ## How it routes
 
