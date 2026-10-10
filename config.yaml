@@ -60,6 +60,10 @@ model_list:
       api_base: "http://192.168.0.34:8095/v1"
       api_key: "none"
       timeout: 600
+      # The model reasons for ~11k tokens before answering, which exhausted the 12k cap and returned empty content (found
+      # 2026-10-10 on the log-review fast lane). Thinking off: ~35 tokens for a trivial prompt instead of ~170, same JSON.
+      extra_body:
+        chat_template_kwargs: { enable_thinking: false }
 
   # custom provider -> agy gateway (see handlers/agy_handler.py)
   - model_name: agy
