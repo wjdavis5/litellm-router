@@ -51,6 +51,16 @@ model_list:
       model: "gemini/gemini-pro-latest"
       api_key: "os.environ/GEMINI_API_KEY"
 
+  # The desktop's local llama-server (the PrismML fork, Bonsai-2-27B ternary on the RTX 5090), 2026-10-10. Pin-only like the
+  # Gemini models: reached with pin:local-bonsai, falls back to `gemini` when the desktop or the server is down.
+  # Bound to the desktop's LAN address only, no auth (the lab's LAN-only rule). Needs the server started on :8095.
+  - model_name: local-bonsai
+    litellm_params:
+      model: "openai/bonsai"
+      api_base: "http://192.168.0.34:8095/v1"
+      api_key: "none"
+      timeout: 600
+
   # custom provider -> agy gateway (see handlers/agy_handler.py)
   - model_name: agy
     litellm_params:
@@ -113,6 +123,7 @@ litellm_settings:
     - opencode: ["deepseek", "claude-code", "agy"]  # "ollama-local" dropped while it's disabled, see above
     - claude-code: ["deepseek", "agy", "opencode"]
     - agy: ["deepseek", "opencode", "claude-code"]
+    - local-bonsai: ["gemini"]            # desktop down or busy -> Gemini
     # - ollama-local: ["deepseek"]  # re-add alongside the model_list entry above
   num_retries: 2
   request_timeout: 120
