@@ -1,22 +1,70 @@
-# litellm proxy config — DB-less. Fronts agy (primary), on-demand local ollama,
-# and an optional cloud fallback. Loaded by the container at /app/config.yaml.
+# litellm proxy config — DB-less. Fronts the DeepSeek API (primary), the agy /
+# opencode / claude-code CLI gateways, and on-demand local ollama. Loaded by the
+# container at /app/config.yaml.
+#
+# SOURCE copy. The DEPLOYED copy is repos/k3s-cluster/litellm-router/config.yaml
+# (k3s, pve01-services) and differs in exactly one line — ollama-local's
+# api_base, which must be the desktop's real LAN IP in a k3s pod rather than
+# Docker Desktop's `host.docker.internal`. Keep the two in sync for everything
+# else; they silently drifted between 2026-09-13 and 2026-09-19, resynced here.
 #
 # Routing is steered by handlers/routing_hook.py (registered under
-# litellm_settings.callbacks): by default every request is redirected to `agy`;
-# an explicit `ollama-local` request triggers on-demand ollama warm-up via the
-# deployed controller, falling back to `cloud` if warm-up fails.
+# litellm_settings.callbacks): THE ROUTER PICKS THE MODEL, NOT THE CALLER. Every
+# request is rewritten to `deepseek` (text) or `deepseek-multimodal` (images /
+# tools) regardless of what the caller asked for — cost policy lives in one
+# place instead of in every consumer's config. The operator escape hatch
+# `pin:<model>` reaches one backend directly, for smoke-testing a fallback.
 
 model_list:
-  # primary: custom provider -> agy gateway (see handlers/agy_handler.py)
+  # primary (2026-09-19): the DeepSeek API direct, no CLI gateway in the path.
+  # `deepseek-flash` is the canonical id for DeepSeek-V4.1-Flash — the legacy
+  # `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp` names still resolve but
+  # point at retired models, so pin the canonical one. Native multimodal, so
+  # this route takes images too. Key: DEEPSEEK_API_KEY in the router Secret.
+  - model_name: deepseek
+    litellm_params:
+      model: "deepseek/deepseek-flash"
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+      api_base: "https://api.deepseek.com/v1"
+
+  # SAME upstream as `deepseek` — the only difference is the fallback chain
+  # below. Requests carrying inline images or tools land here, because the
+  # opencode/claude-code gateways are text-only and RAISE on that content; a
+  # multimodal request must never fall back into them. Verified live
+  # 2026-09-19: an 8x8 PNG through this path answers correctly.
+  - model_name: deepseek-multimodal
+    litellm_params:
+      model: "deepseek/deepseek-flash"
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+      api_base: "https://api.deepseek.com/v1"
+
+  # Google Gemini via the AI Studio API (2026-10-10). NOT in any fallback chain and not what the cost policy picks: it is
+  # reached only by `pin:gemini` / `pin:gemini-pro`, for jobs the owner wants on Gemini (the log reviewer). The *-latest
+  # aliases track Google's current Flash / Pro so a retired model id cannot break the route; pin a dated id if a job needs
+  # the same model for weeks. The key is GEMINI_API_KEY in litellm-router/.env (vaulted) and the k8s Secret.
+  - model_name: gemini
+    litellm_params:
+      model: "gemini/gemini-flash-latest"
+      api_key: "os.environ/GEMINI_API_KEY"
+  - model_name: gemini-pro
+    litellm_params:
+      model: "gemini/gemini-pro-latest"
+      api_key: "os.environ/GEMINI_API_KEY"
+
+  # custom provider -> agy gateway (see handlers/agy_handler.py)
   - model_name: agy
     litellm_params:
       model: "agy/default"
 
-  # on-demand local model served by ollama on the desktop host
-  - model_name: ollama-local
-    litellm_params:
-      model: "ollama_chat/qwen3-vl:8b"
-      api_base: "http://host.docker.internal:11434"
+  # on-demand local model served by ollama on the desktop host (comPlex)
+  # TEMPORARILY DISABLED 2026-09-17 at Will's request — qwen3-vl:8b on the
+  # desktop's ollama was chewing up memory from frequent ollama-local calls.
+  # Re-enable by uncommenting this block + the "ollama-local" fallback lines
+  # below and re-applying this kustomization.
+  # - model_name: ollama-local
+  #   litellm_params:
+  #     model: "ollama_chat/qwen3-vl:8b"
+  #     api_base: "http://host.docker.internal:11434"
 
   # cli-gateways (LXC 108/109): opencode + claude-code as HTTP backends
   # (see handlers/cli_gateway_handler.py; text-only, no tools/images)
@@ -49,12 +97,23 @@ litellm_settings:
   # Re-add "otel" + set OTEL_ENDPOINT once a traces backend is deployed.
   callbacks: ["handlers.routing_hook.hook_instance"]
   set_verbose: false
-  # model-level fallbacks: agy -> cloud, ollama-local -> agy, cli-gateways -> cloud
+  # model-level fallbacks (2026-09-19): default is `deepseek` — the DeepSeek API
+  # direct, which replaces `opencode` (DeepSeek reached *through* a CLI gateway)
+  # as the primary; the gateways stay as fallbacks. Every chain points only at
+  # FUNCTIONAL backends. `cloud` is intentionally absent — it is keyless/dead,
+  # and a fallback to a dead backend is the bug that let the agy outage take
+  # down every consumer (CommandCenter#12/#23).
+  # Chains are CAPABILITY-ordered, not preference-ordered. `deepseek-multimodal`
+  # falls back ONLY to `agy`: it is the one other backend that can take an image
+  # (uploads via POST /files) or a tool schema (--json-schema). Adding a CLI
+  # gateway to that chain would guarantee a provider error, not a recovery.
   fallbacks:
-    - agy: ["cloud"]
-    - ollama-local: ["agy"]
-    - opencode: ["cloud"]
-    - claude-code: ["cloud"]
+    - deepseek: ["opencode", "claude-code", "agy"]
+    - deepseek-multimodal: ["agy"]
+    - opencode: ["deepseek", "claude-code", "agy"]  # "ollama-local" dropped while it's disabled, see above
+    - claude-code: ["deepseek", "agy", "opencode"]
+    - agy: ["deepseek", "opencode", "claude-code"]
+    # - ollama-local: ["deepseek"]  # re-add alongside the model_list entry above
   num_retries: 2
   request_timeout: 120
 
