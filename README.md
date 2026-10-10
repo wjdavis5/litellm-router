@@ -62,6 +62,10 @@ every other consumer were repointed at the new address.
   dead, and falling back to a dead backend is what turned the agy outage into a
   total outage (CommandCenter#12/#23).
 
+## Gemini (pin-only, 2026-10-10)
+
+`gemini` (Flash) and `gemini-pro` (Pro) call Google's Gemini API directly with `GEMINI_API_KEY` (an AI Studio key, in `.env` and the k8s Secret). They use the `*-latest` aliases so a retired model id cannot break the route. They are in **no fallback chain** and the cost policy never picks them: reach them with `"model": "pin:gemini"` or `"pin:gemini-pro"`. Anything sent to them leaves the lab for Google, so scrub transcripts and names first.
+
 ## Build / run
 
 ```bash
