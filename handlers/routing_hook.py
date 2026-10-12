@@ -81,6 +81,60 @@ MULTIMODAL_MODEL = "deepseek-multimodal"
 # Operator escape hatch. "pin:opencode" -> opencode, bypassing the cost policy.
 PIN_PREFIX = "pin:"
 
+# Capabilities this router DEPENDS ON, declared here instead of trusted to litellm's downloaded model map.
+#
+# litellm's DeepSeek transform forwards image parts only when ``supports_vision("deepseek-flash", "deepseek")`` is
+# true; otherwise it collapses the message to its text and the image is silently dropped. It reads that capability
+# from a map fetched from GitHub at process start, and when the fetch fails it falls back to a map bundled in the
+# package that has NO ``deepseek-flash`` entry. 2026-10-11: the pod started before DNS was up after a host reboot
+# ("Failed to fetch remote model cost map ... Falling back to local backup"), and for 32 hours every image request
+# reached DeepSeek as text only. imageAnalysis stored "No image was provided" and invented descriptions for every
+# camera frame and stamped real people "Not a person". Nothing errored, so nothing fell back and nothing alerted.
+REQUIRED_MODEL_INFO: dict[str, dict[str, Any]] = {
+    "deepseek/deepseek-flash": {
+        "litellm_provider": "deepseek",
+        "mode": "chat",
+        "supports_vision": True,
+        "supports_function_calling": True,
+    },
+}
+
+
+def _capabilities_declared() -> bool:
+    """True when litellm's live map already says every required capability (dict lookups only)."""
+    try:
+        import litellm
+
+        cost = getattr(litellm, "model_cost", None) or {}
+        return all(
+            all(cost.get(key, {}).get(field) == value for field, value in info.items())
+            for key, info in REQUIRED_MODEL_INFO.items()
+        )
+    except Exception:
+        return False
+
+
+def declare_model_capabilities() -> bool:
+    """Register ``REQUIRED_MODEL_INFO`` with litellm. Returns True when litellm accepted it.
+
+    Called at import (proxy start) and again from the pre-call hook if the live map has lost an entry, so a failed or
+    later-reloaded model map can never turn the multimodal route blind again. Never raises: a router that cannot
+    declare a capability must still serve text.
+    """
+    try:
+        import litellm
+
+        register = getattr(litellm, "register_model", None)
+        if register is None:
+            return False
+        register({key: dict(info) for key, info in REQUIRED_MODEL_INFO.items()})
+        return True
+    except Exception:
+        return False
+
+
+declare_model_capabilities()
+
 
 def _controller_url() -> str:
     return os.environ.get("CONTROLLER_URL", DEFAULT_CONTROLLER_URL).rstrip("/")
@@ -297,6 +351,10 @@ class RouterHook(CustomLogger):
         data["model"] = (
             MULTIMODAL_MODEL if _needs_rich_capabilities(data) else DEFAULT_MODEL
         )
+        # Self-heal: if litellm's live map no longer says DeepSeek sees images (see REQUIRED_MODEL_INFO), say so
+        # again before this request is transformed, instead of sending a camera frame as text.
+        if data["model"] == MULTIMODAL_MODEL and not _capabilities_declared():
+            declare_model_capabilities()
         return data
 
     async def async_pre_call_deployment_hook(self, kwargs, call_type):

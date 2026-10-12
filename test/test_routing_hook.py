@@ -295,5 +295,75 @@ class DeepseekStructuredOutputTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await hook.async_pre_call_deployment_hook(text, "acompletion"))
 
 
+class DeclaredCapabilitiesTests(unittest.TestCase):
+    """litellm drops image parts for a DeepSeek model its map does not mark as vision-capable, and that map can
+    silently be the bundled fallback (2026-10-11). The hook declares the capability itself."""
+
+    IMAGE_REQUEST = {"model": "anything", "messages": [{"role": "user", "content": [
+        {"type": "text", "text": "describe"},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,AAAA"}}]}]}
+
+    def setUp(self):
+        self.calls = []
+        self._saved = {k: getattr(_fake_litellm, k, None) for k in ("register_model", "model_cost")}
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            if v is None:
+                if hasattr(_fake_litellm, k):
+                    delattr(_fake_litellm, k)
+            else:
+                setattr(_fake_litellm, k, v)
+
+    def _install(self):
+        """An empty live map (the bundled-fallback state) and a recording register_model."""
+        _fake_litellm.model_cost = {}
+
+        def register_model(mapping):
+            self.calls.append(copy.deepcopy(mapping))
+            for key, info in mapping.items():
+                _fake_litellm.model_cost.setdefault(key, {}).update(info)
+
+        _fake_litellm.register_model = register_model
+
+    def test_declares_vision_for_the_deepseek_model(self):
+        self._install()
+        self.assertFalse(routing_hook._capabilities_declared())
+        self.assertTrue(routing_hook.declare_model_capabilities())
+        entry = _fake_litellm.model_cost["deepseek/deepseek-flash"]
+        self.assertTrue(entry["supports_vision"])
+        self.assertEqual(entry["litellm_provider"], "deepseek")
+        self.assertTrue(routing_hook._capabilities_declared())
+
+    def test_never_raises_when_litellm_cannot_register(self):
+        if hasattr(_fake_litellm, "register_model"):
+            delattr(_fake_litellm, "register_model")
+        self.assertFalse(routing_hook.declare_model_capabilities())
+
+        def boom(mapping):
+            raise RuntimeError("nope")
+
+        _fake_litellm.register_model = boom
+        self.assertFalse(routing_hook.declare_model_capabilities())
+
+    def test_an_image_request_redeclares_a_capability_the_live_map_lost(self):
+        self._install()
+        hook = routing_hook.RouterHook()
+        out = asyncio.run(hook.async_pre_call_hook(None, None, copy.deepcopy(self.IMAGE_REQUEST), "acompletion"))
+        self.assertEqual(out["model"], routing_hook.MULTIMODAL_MODEL)
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue(routing_hook._capabilities_declared())
+        asyncio.run(hook.async_pre_call_hook(None, None, copy.deepcopy(self.IMAGE_REQUEST), "acompletion"))
+        self.assertEqual(len(self.calls), 1, "already declared: must not register again on every request")
+
+    def test_a_text_request_does_not_touch_the_map(self):
+        self._install()
+        hook = routing_hook.RouterHook()
+        out = asyncio.run(hook.async_pre_call_hook(
+            None, None, {"model": "x", "messages": [{"role": "user", "content": "hi"}]}, "acompletion"))
+        self.assertEqual(out["model"], routing_hook.DEFAULT_MODEL)
+        self.assertEqual(self.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()
