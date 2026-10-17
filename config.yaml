@@ -60,10 +60,13 @@ model_list:
       api_base: "http://192.168.0.34:8095/v1"
       api_key: "none"
       timeout: 600
-      # The model reasons for ~11k tokens before answering, which exhausted the 12k cap and returned empty content (found
-      # 2026-10-10 on the log-review fast lane). Thinking off: ~35 tokens for a trivial prompt instead of ~170, same JSON.
+      # Keep thinking ON but at LOW reasoning effort (2026-10-17). The model's chat template defaults reasoning_effort
+      # to 'xhigh', which reasons for thousands of tokens and exhausted the budget (the empty-content failures found
+      # 2026-10-10). The levels are low|medium|xhigh; the server's own default is now 'medium' (start-server.ps1), and
+      # callers that want it snappier send 'low' here. Earlier this was enable_thinking:false (no reasoning at all);
+      # Will wants reasoning kept, just bounded.
       extra_body:
-        chat_template_kwargs: { enable_thinking: false }
+        chat_template_kwargs: { enable_thinking: true, reasoning_effort: "low" }
 
   # custom provider -> agy gateway (see handlers/agy_handler.py)
   - model_name: agy
