@@ -10,4 +10,5 @@ opencode_llm = CliGatewayLLM(
     provider="opencode",
     env_prefix="OPENCODE",
     default_base="http://192.168.0.93:8100",
+    supports_images=True,   # `opencode run -f` attaches images (2026-10-20); the gateway stages them as files
 )

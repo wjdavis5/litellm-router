@@ -49,15 +49,15 @@ model_list:
   # Enable with: sed -i 's/^\(\s*\)#GO /\1/' config.yaml (both copies), then re-apply. The model string after
   # `opencode/` is passed to the gateway as the CLI model (handlers/cli_gateway_handler.py). Z.ai's coding-plan
   # terms allow it only inside listed tools such as opencode, never behind this proxy directly.
-#GO   - model_name: generic
-#GO     litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 180}
-#GO     model_info: {id: generic-go-deepseek-flash}
-#GO   - model_name: generic
-#GO     litellm_params: {model: "opencode/opencode-go/glm-5.3-flash", weight: 2, order: 2, timeout: 180}
-#GO     model_info: {id: generic-go-glm-flash}
-#GO   - model_name: generic
-#GO     litellm_params: {model: "opencode/zai-coding-plan/glm-5.3-flash", weight: 2, order: 2, timeout: 180}
-#GO     model_info: {id: generic-zai-glm-flash}
+  - model_name: generic
+    litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 180}
+    model_info: {id: generic-go-deepseek-flash}
+  - model_name: generic
+    litellm_params: {model: "opencode/opencode-go/glm-5.3-flash", weight: 2, order: 2, timeout: 180}
+    model_info: {id: generic-go-glm-flash}
+  - model_name: generic
+    litellm_params: {model: "opencode/zai-coding-plan/glm-5.3-flash", weight: 2, order: 2, timeout: 180}
+    model_info: {id: generic-zai-glm-flash}
   - model_name: generic
     litellm_params:
       model: "gemini/gemini-flash-latest"       # AI Studio free tier (limits unpublished; 429 -> cooldown)
@@ -94,32 +94,43 @@ model_list:
     model_info: {id: generic-api-gemini-flash}
 
   # --- vision: requests carrying images ------------------------------------
-  # The hook declares deepseek-flash's vision capability itself (routing_hook.REQUIRED_MODEL_INFO); gemini/ and
-  # openai/ providers forward images regardless. Fallback: agy (uploads the image via POST /files).
+  # Same order as the text groups since 2026-10-20 evening: the opencode gateway attaches images to the message
+  # (`opencode run -f`, live-verified on Go's deepseek-v4.1-flash and qwen3.8-max), so Go DeepSeek Flash is the
+  # default here too (handlers/cli_gateway_handler.py sends inline data-URL images as `images`); order 2 = Gemini
+  # Flash + Go qwen3.8-max; order 3 = the DeepSeek API key (the hook declares its vision capability itself,
+  # routing_hook.REQUIRED_MODEL_INFO). Fallback: agy (uploads the image via POST /files).
   - model_name: vision
-    litellm_params:
-      model: "deepseek/deepseek-flash"
-      api_key: "os.environ/DEEPSEEK_API_KEY"
-      api_base: "https://api.deepseek.com/v1"
-      weight: 5
-    model_info: {id: vision-deepseek-api}
+    litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 240}
+    model_info: {id: vision-go-deepseek-flash}
   - model_name: vision
     litellm_params:
       model: "gemini/gemini-flash-latest"
       api_key: "os.environ/GEMINI_API_KEY"
       weight: 3
+      order: 2
     model_info: {id: vision-gemini-flash}
+  - model_name: vision
+    litellm_params: {model: "opencode/opencode-go/qwen3.8-max", weight: 2, order: 2, timeout: 240}
+    model_info: {id: vision-go-qwen-max}
+  - model_name: vision
+    litellm_params:
+      model: "deepseek/deepseek-flash"
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+      api_base: "https://api.deepseek.com/v1"
+      weight: 1
+      order: 3
+    model_info: {id: vision-deepseek-api}
 
   # --- reasoning: harder problems ---------------------------------------------
   # Will, 2026-10-20: "Reasoning and code should never go to those 2 old models" (DeepSeek V4 Pro, Gemini Pro):
   # "DeepSeek 4.1 Flash and Gemini Flash are both darn superior." So the same Flash pair as generic, kept as its
   # own group so the Go / Claude members can join reasoning without touching generic.
-#GO   - model_name: reasoning
-#GO     litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 300}
-#GO     model_info: {id: reasoning-go-deepseek-flash}
-#GO   - model_name: reasoning
-#GO     litellm_params: {model: "opencode/opencode-go/kimi-k3", weight: 1, order: 2, timeout: 300}
-#GO     model_info: {id: reasoning-go-kimi-k3}
+  - model_name: reasoning
+    litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 300}
+    model_info: {id: reasoning-go-deepseek-flash}
+  - model_name: reasoning
+    litellm_params: {model: "opencode/opencode-go/kimi-k3", weight: 1, order: 2, timeout: 300}
+    model_info: {id: reasoning-go-kimi-k3}
   - model_name: reasoning
     litellm_params:
       model: "gemini/gemini-flash-latest"
@@ -137,18 +148,18 @@ model_list:
     model_info: {id: reasoning-deepseek-flash}
 
   # --- code: Go DeepSeek first, the other coding subscriptions + Gemini as spill-over, the API key last -------
-#GO   - model_name: code
-#GO     litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 300}
-#GO     model_info: {id: code-go-deepseek-flash}
-#GO   - model_name: code
-#GO     litellm_params: {model: "opencode/opencode-go/kimi-k2.7-code", weight: 2, order: 2, timeout: 300}
-#GO     model_info: {id: code-go-kimi-code}
-#GO   - model_name: code
-#GO     litellm_params: {model: "opencode/opencode-go/qwen3.8-max", weight: 2, order: 2, timeout: 300}
-#GO     model_info: {id: code-go-qwen-max}
-#GO   - model_name: code
-#GO     litellm_params: {model: "opencode/zai-coding-plan/glm-5.3", weight: 2, order: 2, timeout: 300}
-#GO     model_info: {id: code-zai-glm}
+  - model_name: code
+    litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 300}
+    model_info: {id: code-go-deepseek-flash}
+  - model_name: code
+    litellm_params: {model: "opencode/opencode-go/kimi-k2.7-code", weight: 2, order: 2, timeout: 300}
+    model_info: {id: code-go-kimi-code}
+  - model_name: code
+    litellm_params: {model: "opencode/opencode-go/qwen3.8-max", weight: 2, order: 2, timeout: 300}
+    model_info: {id: code-go-qwen-max}
+  - model_name: code
+    litellm_params: {model: "opencode/zai-coding-plan/glm-5.3", weight: 2, order: 2, timeout: 300}
+    model_info: {id: code-zai-glm}
   # - model_name: code
   #   litellm_params: {model: "claudecode/sonnet", weight: 2, order: 2, timeout: 300}
   #   model_info: {id: code-claude-sonnet}
@@ -169,12 +180,12 @@ model_list:
     model_info: {id: code-deepseek-flash}
 
   # --- web: web-grounded answers (searches on every call, takes no tools) ---
-  # ENABLE once PERPLEXITYAI_API_KEY is in the router Secret (the key lives in the desktop's Claude Code MCP
-  # config today). Perplexity retired the Sonar chat-completions shape 2026-09-27 but still reformulates such
-  # requests into its Agent API; verify with pin:web after enabling.
-  # - model_name: web
-  #   litellm_params: {model: "perplexity/sonar", api_key: "os.environ/PERPLEXITYAI_API_KEY"}
-  #   model_info: {id: web-perplexity-sonar}
+  # PERPLEXITYAI_API_KEY in the router Secret since 2026-10-20 (other copy: the desktop's Claude Code MCP config).
+  # Perplexity retired the Sonar chat-completions shape 2026-09-27 but still reformulates such requests into its
+  # Agent API ($0.25 / $2.50 per M plus search fees); nothing in the lab uses it yet.
+  - model_name: web
+    litellm_params: {model: "perplexity/sonar", api_key: "os.environ/PERPLEXITYAI_API_KEY"}
+    model_info: {id: web-perplexity-sonar}
 
   # --- embeddings: ONE vector space per group name ---------------------------
   # Never load-share or fall back across embedding models: vectors from different models are incomparable,

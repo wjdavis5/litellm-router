@@ -171,10 +171,10 @@ class CliGatewayHandlerTest(unittest.TestCase):
         with self.assertRaises(_APIConnectionError):
             opencode_llm.completion(model="m", messages=[{"role": "user", "content": "x"}])
 
-    def test_inline_image_raises_clear_provider_error(self):
+    def test_inline_image_raises_on_a_gateway_without_image_support(self):
         cgh._post_run = lambda *a, **kw: dict(GATEWAY_OK)
         with self.assertRaises(_APIConnectionError) as ctx:
-            opencode_llm.completion(
+            claudecode_llm.completion(
                 model="m",
                 messages=[
                     {
@@ -187,6 +187,53 @@ class CliGatewayHandlerTest(unittest.TestCase):
                 ],
             )
         self.assertIn("images are not supported", str(ctx.exception))
+
+    def test_inline_images_are_attached_for_the_opencode_gateway(self):
+        seen = {}
+
+        def fake_post(base, token, payload, timeout):
+            seen["payload"] = payload
+            return dict(GATEWAY_OK)
+
+        cgh._post_run = fake_post
+        opencode_llm.completion(
+            model="opencode-go/deepseek-v4.1-flash",
+            messages=[
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what colour"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                    {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,BBBB"}},
+                ]},
+            ],
+        )
+        self.assertEqual(seen["payload"]["images"], [{"mime": "image/png", "data": "AAAA"}, {"mime": "image/jpeg", "data": "BBBB"}])
+        self.assertIn("[attached image 1]", seen["payload"]["prompt"])
+        self.assertIn("[attached image 2]", seen["payload"]["prompt"])
+        # not a base64 image data URL -> still a clear error (the router falls back)
+        with self.assertRaises(_APIConnectionError):
+            opencode_llm.completion(model="m", messages=[{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:text/plain;base64,AAAA"}}]}])
+
+    def test_json_response_format_is_stated_in_the_prompt_and_fences_are_stripped(self):
+        seen = {}
+
+        def fake_post(base, token, payload, timeout):
+            seen["payload"] = payload
+            return {"ok": True, "response": "```json\n{\"title\": \"x\", \"level\": 0}\n```", "durationMs": 1}
+
+        cgh._post_run = fake_post
+        schema = {"type": "object", "properties": {"title": {"type": "string"}}}
+        resp = opencode_llm.completion(
+            model="m", messages=[{"role": "user", "content": "summarise"}],
+            response_format={"type": "json_schema", "json_schema": {"name": "s", "schema": schema}},
+        )
+        self.assertIn("single valid JSON object", seen["payload"]["prompt"])
+        self.assertIn('"title"', seen["payload"]["prompt"])
+        self.assertEqual(resp.choices[0].message.content, '{"title": "x", "level": 0}')
+        # a fenced block that is not JSON is left alone
+        self.assertEqual(cgh._strip_json_fences("```python\nprint(1)\n```"), "```python\nprint(1)\n```")
+        self.assertIsNone(cgh._json_instruction({"type": "text"}))
+        self.assertIsNotNone(cgh._json_instruction({"type": "json_object"}))
 
     def test_remote_image_url_passes_as_text(self):
         seen = {}

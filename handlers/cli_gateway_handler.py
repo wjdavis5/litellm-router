@@ -25,6 +25,7 @@ monkeypatch them; ``httpx`` is imported lazily inside them.
 
 from __future__ import annotations
 
+import json
 import os
 from typing import Any, Dict, List, Optional
 
@@ -84,7 +85,26 @@ class UnsupportedContentError(ValueError):
     """Caller content these gateways cannot serve (images, tools)."""
 
 
-def _flatten_content(content: Any) -> str:
+_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
+
+
+def _parse_data_url(url: str) -> Optional[Dict[str, str]]:
+    """``data:image/png;base64,....`` -> {"mime", "data"} for the gateway's ``images`` field, else None."""
+    header, sep, data = url.partition(",")
+    if not sep or not header.startswith("data:") or not data:
+        return None
+    meta = header[5:].split(";")
+    mime = meta[0].strip().lower()
+    if "base64" not in meta[1:] or mime not in _IMAGE_MIMES:
+        return None
+    return {"mime": mime, "data": "".join(data.split())}
+
+
+def _flatten_content(content: Any, images: Optional[List[Dict[str, str]]] = None) -> str:
+    """Flatten one message's content. Inline (data URL) images are appended to
+    ``images`` when the gateway can attach them (opencode, 2026-10-20) and
+    referenced in the text; a gateway without image support still raises so
+    the router falls back to a backend that has it."""
     if content is None:
         return ""
     if isinstance(content, str):
@@ -101,18 +121,62 @@ def _flatten_content(content: Any) -> str:
             image_url = part.get("image_url") or {}
             url = image_url.get("url", "") if isinstance(image_url, dict) else str(image_url)
             if url.startswith("data:"):
-                raise UnsupportedContentError(
-                    "inline images are not supported by this gateway (no upload path); "
-                    "use the agy model for image analysis"
-                )
-            if url:
+                if images is None:
+                    raise UnsupportedContentError(
+                        "inline images are not supported by this gateway (no upload path); "
+                        "use the agy model for image analysis"
+                    )
+                parsed = _parse_data_url(url)
+                if parsed is None:
+                    raise UnsupportedContentError(
+                        "inline image is not a base64 data URL of a png/jpeg/webp/gif this gateway can attach"
+                    )
+                images.append(parsed)
+                pieces.append(f"[attached image {len(images)}]")
+            elif url:
                 pieces.append(f"[image: {url}]")
         elif "text" in part:
             pieces.append(part.get("text", ""))
     return "\n".join(p for p in pieces if p)
 
 
-def _build_prompt(messages: List[Dict[str, Any]]) -> str:
+def _json_instruction(response_format: Any) -> Optional[str]:
+    """The CLIs have no ``response_format``; a JSON request gets the ask stated in the prompt instead
+    (json_schema -> the schema spelled out, json_object -> a one-liner). None for text/absent."""
+    if not isinstance(response_format, dict):
+        return None
+    rtype = response_format.get("type")
+    if rtype == "json_schema":
+        spec = response_format.get("json_schema")
+        schema = spec.get("schema") if isinstance(spec, dict) else None
+        text = "Respond with a single valid JSON object and nothing else (no markdown fences, no prose)."
+        if isinstance(schema, dict) and schema:
+            text += " The object must conform to this JSON Schema:\n" + json.dumps(schema, ensure_ascii=False)
+        return text
+    if rtype == "json_object":
+        return "Respond with a single valid JSON object and nothing else (no markdown fences, no prose)."
+    return None
+
+
+def _strip_json_fences(text: str) -> str:
+    """A reply that is exactly one fenced block whose body parses as JSON becomes the bare JSON
+    (models asked for JSON through a CLI like to wrap it in ```json fences; Frigate and HA parse the body)."""
+    stripped = text.strip()
+    if not (stripped.startswith("```") and stripped.endswith("```")):
+        return text
+    inner = stripped[3:-3]
+    first_nl = inner.find("\n")
+    if first_nl != -1 and inner[:first_nl].strip().isalnum():
+        inner = inner[first_nl + 1:]
+    inner = inner.strip()
+    try:
+        json.loads(inner)
+    except Exception:
+        return text
+    return inner
+
+
+def _build_prompt(messages: List[Dict[str, Any]], images: Optional[List[Dict[str, str]]] = None) -> str:
     """Flatten messages into one prompt: system turns first, then dialogue.
     role:"tool" results are rendered as plain text so a post-tool-execution
     transcript still reads coherently. (These gateways reject requests that
@@ -122,7 +186,7 @@ def _build_prompt(messages: List[Dict[str, Any]]) -> str:
     turns: List[str] = []
     for msg in messages or []:
         role = (msg.get("role") or "user").lower()
-        text = _flatten_content(msg.get("content"))
+        text = _flatten_content(msg.get("content"), images)
         if role == "tool":
             name = msg.get("name") or msg.get("tool_call_id") or "tool"
             turns.append(f"Tool result ({name}): {text}")
@@ -145,7 +209,7 @@ def _build_prompt(messages: List[Dict[str, Any]]) -> str:
 
 
 def _map_response(model: Optional[str], body: Dict[str, Any]) -> "litellm.ModelResponse":
-    text = body.get("response", "") or ""
+    text = _strip_json_fences(body.get("response", "") or "")
     model_response = litellm.ModelResponse()
     message = litellm.Message(content=text, role="assistant")
     choice = litellm.Choices(index=0, message=message, finish_reason="stop")
@@ -169,11 +233,14 @@ def _map_response(model: Optional[str], body: Dict[str, Any]) -> "litellm.ModelR
 class CliGatewayLLM(litellm.CustomLLM):
     """Routes litellm completions to one cli-gateways instance."""
 
-    def __init__(self, provider: str, env_prefix: str, default_base: str):
+    def __init__(self, provider: str, env_prefix: str, default_base: str, supports_images: bool = False):
         super().__init__()
         self.provider = provider
         self.env_prefix = env_prefix
         self.default_base = default_base
+        # The opencode gateway attaches images to the message (`opencode run -f`, 2026-10-20); the claude
+        # gateway cannot, and keeps raising so the router falls back to a backend that can.
+        self.supports_images = supports_images
 
     def _base(self) -> str:
         return os.environ.get(f"{self.env_prefix}_BASE", self.default_base).rstrip("/")
@@ -199,10 +266,16 @@ class CliGatewayLLM(litellm.CustomLLM):
                 f"tool calling is not supported by the {self.provider} gateway; "
                 "route tool-using requests to agy or cloud",
             )
+        images: Optional[List[Dict[str, str]]] = [] if self.supports_images else None
         try:
-            prompt = _build_prompt(messages)
+            prompt = _build_prompt(messages, images)
         except UnsupportedContentError as exc:
             raise _provider_error(self.provider, model, str(exc)) from exc
+        # A JSON request (Frigate's review summaries, HA's AI Task, imageAnalysis) has no response_format on a
+        # CLI path: state it in the prompt; _map_response strips the fences models like to add.
+        instruction = _json_instruction(kwargs.get("response_format") or optional_params.get("response_format"))
+        if instruction:
+            prompt = prompt + "\n\n" + instruction
 
         timeout = float(kwargs.get("timeout") or 120.0)
         # The gateway gets the true budget; the httpx client waits a few seconds
@@ -223,6 +296,8 @@ class CliGatewayLLM(litellm.CustomLLM):
         requested = optional_params.get("model")
         if isinstance(requested, str) and requested.strip():
             payload["model"] = requested
+        if images:
+            payload["images"] = images
         return model, payload, http_timeout
 
     def _finish(self, model: Optional[str], body: Any) -> "litellm.ModelResponse":

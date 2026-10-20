@@ -36,7 +36,7 @@ every other consumer were repointed at the new address.
   |---|---|---|
   | `generic` | order 1: **Go DeepSeek-V4.1-Flash through the opencode gateway, alone** (`#GO`); order 2 (spill-over): Gemini Flash (3), Go GLM Flash (2), Z.ai GLM Flash (2), later Claude sonnet; order 3: the DeepSeek API key | the opencode gateway's Go + Z.ai keys, `claudecode/sonnet` (its login) |
   | `generic-api` | the tool-capable subset: DeepSeek Flash (5), Gemini Flash (3) | — |
-  | `vision` | DeepSeek Flash (5), Gemini Flash (3); fallback `agy` | — |
+  | `vision` | order 1 Go DeepSeek Flash through the opencode gateway (images attached with `opencode run -f`); order 2 Gemini Flash (3), Go qwen3.8-max (2); order 3 the API key; fallback `agy` | — |
   | `reasoning` | same shape: order 1 Go DeepSeek Flash; order 2 Gemini Flash, Go Kimi K3; order 3 the API key — its own group so members can differ from `generic` later; the Pro models were taken out the same day (Will: "the Flash models are both darn superior") | the same keys |
   | `code` | order 1 Go DeepSeek Flash; order 2 the other coding subscriptions (Go `kimi-k2.7-code`, `qwen3.8-max`, Z.ai `glm-5.3`, Claude sonnet) and Gemini Flash; order 3 the API key | the same keys |
   | `web` | Perplexity `sonar` | `PERPLEXITYAI_API_KEY` |
@@ -83,10 +83,16 @@ every other consumer were repointed at the new address.
   latency instead of spilling. The `#GO ` lines in `config.yaml` are the
   gateway-backed members, ready to run; they are enabled
   (`sed -i 's/^\(\s*\)#GO /\1/'` on both copies, re-apply) together with the
-  gateway rollout that carries the Go and Z.ai keys. Until then Gemini Flash is
-  the lowest healthy order and the API key the spill-over. `vision` and
-  `generic-api` cannot use the gateway (text-only CLI wrapper: no images, no
-  tools), so they stay on the DeepSeek API + Gemini by weight.
+  gateway rollout that carries the Go and Z.ai keys (done 2026-10-20 evening:
+  every text call now lands on `*-go-deepseek-flash`, ~2 s each). `vision`
+  rides the same gateway since image attachments landed (`images` in the
+  gateway payload, built from OpenAI data-URL parts by
+  `handlers/cli_gateway_handler.py`); only `generic-api` (tool calls) bypasses
+  it, because the CLI wrapper cannot take `tools`. The gateway handler also
+  states a JSON request (`response_format` json_schema / json_object) in the
+  prompt — the CLIs have no response_format — and strips the ```json fences
+  from the reply when the body parses, so Frigate's and HA's structured
+  requests work through it.
 - **deepseek backend.** Plain litellm `deepseek/deepseek-flash` against
   `https://api.deepseek.com/v1` — no CLI gateway in the path, so it honours
   OpenAI `response_format` (after the `json_schema` → `json_object` rewrite
