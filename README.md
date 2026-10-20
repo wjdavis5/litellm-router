@@ -34,11 +34,11 @@ every other consumer were repointed at the new address.
 
   | group | members today (weight) | waiting on |
   |---|---|---|
-  | `generic` | DeepSeek Flash (5), Gemini Flash (3) | the opencode gateway's Go + Z.ai coding-plan models (Secret keys), `claudecode/sonnet` (its login) |
+  | `generic` | order 1: Gemini Flash (3) (+ the `#GO` members once enabled: Go DeepSeek Flash (5), Go GLM Flash (2), Z.ai GLM Flash (2)); order 2: DeepSeek API (5) | the opencode gateway's Go + Z.ai keys, `claudecode/sonnet` (its login) |
   | `generic-api` | the tool-capable subset: DeepSeek Flash (5), Gemini Flash (3) | — |
   | `vision` | DeepSeek Flash (5), Gemini Flash (3); fallback `agy` | — |
-  | `reasoning` | DeepSeek V4 Pro (3), Gemini Pro (3) | Go's Pro / Kimi via the gateway |
-  | `code` | order 1: the coding subscriptions (gateway Go `kimi-k2.7-code`, `qwen3.8-max`, Z.ai `glm-5.3`, Claude sonnet); order 2: DeepSeek V4 Pro, Gemini Pro | the same keys |
+  | `reasoning` | DeepSeek Flash (5), Gemini Flash (3) — its own group so Go / Claude members can join it without touching `generic`; the Pro models were taken out the same day (Will: "the Flash models are both darn superior") | Go's models via the gateway |
+  | `code` | order 1: the coding subscriptions (gateway Go `kimi-k2.7-code`, `qwen3.8-max`, Z.ai `glm-5.3`, Claude sonnet); order 2: DeepSeek Flash, Gemini Flash | the same keys |
   | `web` | Perplexity `sonar` | `PERPLEXITYAI_API_KEY` |
   | `embeddings` / `embeddings-gemini` | Gemini `gemini-embedding-2` (3072 dims) | a local `embeddings-local` pod (Ollama cannot serve the EmbeddingGemma 2 GGUF) |
   | `transcription` | the lab whisper server (`openai/whisper-1` at `192.168.0.88:30880/v1`, timeout 900 s) | nothing: no cloud fallback on purpose |
@@ -61,21 +61,33 @@ every other consumer were repointed at the new address.
   JSON line (`group`, `deployment`, `provider`, `tokens`, `seconds`,
   `caller_model`) to the pod's stdout, which alloy-pods ships to Loki; count it
   by `deployment`. The response also carries `x-litellm-model-id`.
-- **Subscriptions that must stay behind a CLI.** opencode Go answers direct HTTP
-  (probed 2026-10-20) but its terms call it a product for coding agents, so the
-  direct `go-*` deployments are commented pin-only entries (promoting them is
-  the owner's call); the Z.ai coding plan's terms forbid proxying outright and it
-  is reachable only as `opencode/zai-coding-plan/*` through the opencode gateway;
-  Claude Max and Antigravity are CLI-only by their own terms (the claude / agy
-  gateways). The gateway handler passes the deployment's model name through
+- **The subscription tools are used only THROUGH their CLIs** (Will, 2026-10-20:
+  "the entire reason we containerized opencode and made the litellm proxy was
+  to translate requests from our environment into valid requests through those
+  tools. It's the only authorized way and it takes full advantage of the plans
+  we pay for"). opencode Go and the Z.ai coding plan are reached as
+  `opencode/opencode-go/*` and `opencode/zai-coding-plan/*` through the opencode
+  gateway, Claude Max as `claudecode/*` through the claude gateway, Antigravity
+  through the agy gateway; **no direct Go/Zen/Z.ai deployment exists in this
+  proxy** (direct Go HTTP was probed working and deliberately not wired). The
+  gateway handler passes the deployment's model name through
   (`opencode/opencode-go/glm-5.3-flash` → `-m opencode-go/glm-5.3-flash`), so one
   gateway serves several router deployments.
+- **Order: the shim's DeepSeek before our API key.** In `generic`, `reasoning`
+  and `code`, order 1 is DeepSeek-V4.1-Flash on the Go subscription through the
+  opencode gateway (with Gemini Flash and the other subscription models beside
+  it); the paid DeepSeek API is order 2 and only takes a request while every
+  order-1 member is cooled down. The `#GO ` lines in `config.yaml` are those
+  order-1 members, ready to run; they are enabled (`sed -i 's/^\(\s*\)#GO /\1/'`
+  on both copies, re-apply) together with the gateway rollout that carries the
+  Go and Z.ai keys. Until then Gemini Flash is the only order-1 member.
 - **deepseek backend.** Plain litellm `deepseek/deepseek-flash` against
   `https://api.deepseek.com/v1` — no CLI gateway in the path, so it honours
   OpenAI `response_format` (after the `json_schema` → `json_object` rewrite
   below) and has no prompt-size quirk. `deepseek-flash` is the canonical id for
-  **DeepSeek-V4.1-Flash** (natively multimodal); `deepseek-v4-pro` is the bigger
-  model in `reasoning`/`code`.
+  **DeepSeek-V4.1-Flash** (natively multimodal). `deepseek-v4-pro` and
+  `gemini-pro-latest` are older models and sit in no group (`gemini-pro` stays
+  as a pin for A/B only).
 - **agy backend.** `handlers/agy_handler.py` is a `litellm.CustomLLM` that
   flattens OpenAI `messages` into one prompt, uploads inline base64 images to
   the agy gateway's `POST /files`, references the stored path in the prompt,

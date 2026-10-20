@@ -11,7 +11,8 @@ with cooldowns and fallbacks (``config.yaml``). The groups:
 - ``generic-api``   the API-only, tool-capable members of ``generic`` (the CLI
                     gateways cannot take ``tools``); tool requests land here
 - ``vision``        requests carrying images (DeepSeek, Gemini; agy as fallback)
-- ``reasoning``     harder problems: DeepSeek V4 Pro, Gemini Pro, Go's Pro/Kimi
+- ``reasoning``     harder problems: the same Flash pair today (Will: the Pro
+                    models are older and worse), Go's models when enabled
 - ``code``          code generation: the coding subscriptions first, API spill-over
 - ``web``           web-grounded answers (Perplexity)
 - ``embeddings``    ONE vector space per group name (never load-shared across
@@ -114,6 +115,7 @@ CALLER_ALIASES = {
     "deepseek-multimodal": VISION_GROUP,
     "deepseek-chat": "generic",
     "deepseek-reasoner": "reasoning",
+    "deepseek-pro": "reasoning",
     "opencode": "generic",
     "claude-code": "generic",
     "agy": "generic",

@@ -25,8 +25,9 @@
 #
 # Secrets (k8s Secret litellm-router-secrets): DEEPSEEK_API_KEY, GEMINI_API_KEY,
 # AGY_TOKEN/OPENCODE_TOKEN/CLAUDECODE_TOKEN (+ *_BASE), CONTROLLER_TOKEN.
-# Pending (2026-10-20, see the commented blocks): PERPLEXITYAI_API_KEY (the `web`
-# group) and OPENCODE_API_KEY (direct Go pins).
+# Pending (2026-10-20, see the commented block): PERPLEXITYAI_API_KEY (the `web` group).
+# The subscription keys (opencode Go, Z.ai) live in the opencode GATEWAY's Secret,
+# never here: those plans are used only through their CLIs.
 
 model_list:
   # =========================================================================
@@ -34,36 +35,45 @@ model_list:
   # =========================================================================
 
   # --- generic: plain text chat, the default for anything unrecognised ------
-  - model_name: generic
-    litellm_params:
-      model: "deepseek/deepseek-flash"          # DeepSeek-V4.1-Flash, the cheapest capable API
-      api_key: "os.environ/DEEPSEEK_API_KEY"
-      api_base: "https://api.deepseek.com/v1"
-      weight: 5
-    model_info: {id: generic-deepseek-api}
+  # ORDER (Will, 2026-10-20: "use the opencode shim first and foremost for all requests to deepseek before our
+  # api. That's literally why we built it"): order 1 = DeepSeek-V4.1-Flash on the opencode Go subscription through
+  # the opencode gateway (plus Gemini Flash, which keeps sharing the load, and the other subscription models);
+  # order 2 = the paid DeepSeek API, used only while every order-1 member is cooled down. litellm considers only
+  # the lowest healthy order.
+  #
+  # The `#GO ` lines are the order-1 subscription members, written ready to run. They stay commented until the
+  # opencode gateway rollout that carries OPENCODE_API_KEY + ZHIPU_API_KEY (task: enable gateway-backed members):
+  # today's gateway (2.0.25, DeepSeek API key) would 502 on these model names and cool down three times a minute.
+  # Enable with: sed -i 's/^\(\s*\)#GO /\1/' config.yaml (both copies), then re-apply. The model string after
+  # `opencode/` is passed to the gateway as the CLI model (handlers/cli_gateway_handler.py). Z.ai's coding-plan
+  # terms allow it only inside listed tools such as opencode, never behind this proxy directly.
+#GO   - model_name: generic
+#GO     litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 5, order: 1, timeout: 180}
+#GO     model_info: {id: generic-go-deepseek-flash}
+#GO   - model_name: generic
+#GO     litellm_params: {model: "opencode/opencode-go/glm-5.3-flash", weight: 2, order: 1, timeout: 180}
+#GO     model_info: {id: generic-go-glm-flash}
+#GO   - model_name: generic
+#GO     litellm_params: {model: "opencode/zai-coding-plan/glm-5.3-flash", weight: 2, order: 1, timeout: 180}
+#GO     model_info: {id: generic-zai-glm-flash}
   - model_name: generic
     litellm_params:
       model: "gemini/gemini-flash-latest"       # AI Studio free tier (limits unpublished; 429 -> cooldown)
       api_key: "os.environ/GEMINI_API_KEY"
       weight: 3
+      order: 1
     model_info: {id: generic-gemini-flash}
-  # The opencode gateway's subscription models (opencode Go: per-model monthly $ caps; Z.ai GLM coding plan,
-  # whose terms allow it only inside listed tools such as opencode, never behind this proxy directly). The model
-  # string after `opencode/` is passed to the gateway as the CLI model (handlers/cli_gateway_handler.py).
-  # ENABLE WITH THE GATEWAY ROLLOUT that carries OPENCODE_API_KEY + ZHIPU_API_KEY (2026-10-20): until then the
-  # live gateway runs 2.0.25 on DeepSeek and would error on these names.
-  # - model_name: generic
-  #   litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 2, timeout: 180}
-  #   model_info: {id: generic-go-deepseek-flash}
-  # - model_name: generic
-  #   litellm_params: {model: "opencode/opencode-go/glm-5.3-flash", weight: 1, timeout: 180}
-  #   model_info: {id: generic-go-glm-flash}
-  # - model_name: generic
-  #   litellm_params: {model: "opencode/zai-coding-plan/glm-5.3-flash", weight: 1, timeout: 180}
-  #   model_info: {id: generic-zai-glm-flash}
+  - model_name: generic
+    litellm_params:
+      model: "deepseek/deepseek-flash"          # the paid DeepSeek API: spill-over once the Go path is enabled
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+      api_base: "https://api.deepseek.com/v1"
+      weight: 5
+      order: 2
+    model_info: {id: generic-deepseek-api}
   # Claude Max through the claude gateway: add once its login works (CLAUDE_CODE_OAUTH_TOKEN, CommandCenter).
   # - model_name: generic
-  #   litellm_params: {model: "claudecode/sonnet", weight: 1, timeout: 180}
+  #   litellm_params: {model: "claudecode/sonnet", weight: 1, order: 1, timeout: 180}
   #   model_info: {id: generic-claude-sonnet}
 
   # --- generic-api: the API-only members of generic (take `tools`) ----------
@@ -98,56 +108,64 @@ model_list:
       weight: 3
     model_info: {id: vision-gemini-flash}
 
-  # --- reasoning: harder problems, bigger models ----------------------------
+  # --- reasoning: harder problems ---------------------------------------------
+  # Will, 2026-10-20: "Reasoning and code should never go to those 2 old models" (DeepSeek V4 Pro, Gemini Pro):
+  # "DeepSeek 4.1 Flash and Gemini Flash are both darn superior." So the same Flash pair as generic, kept as its
+  # own group so the Go / Claude members can join reasoning without touching generic.
+#GO   - model_name: reasoning
+#GO     litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 5, order: 1, timeout: 300}
+#GO     model_info: {id: reasoning-go-deepseek-flash}
+#GO   - model_name: reasoning
+#GO     litellm_params: {model: "opencode/opencode-go/kimi-k3", weight: 1, order: 1, timeout: 300}
+#GO     model_info: {id: reasoning-go-kimi-k3}
   - model_name: reasoning
     litellm_params:
-      model: "deepseek/deepseek-v4-pro"         # ~4x Flash's price, still cents per million
-      api_key: "os.environ/DEEPSEEK_API_KEY"
-      api_base: "https://api.deepseek.com/v1"
-      weight: 3
-    model_info: {id: reasoning-deepseek-pro}
-  - model_name: reasoning
-    litellm_params:
-      model: "gemini/gemini-pro-latest"
+      model: "gemini/gemini-flash-latest"
       api_key: "os.environ/GEMINI_API_KEY"
       weight: 3
-    model_info: {id: reasoning-gemini-pro}
-  # - model_name: reasoning
-  #   litellm_params: {model: "opencode/opencode-go/deepseek-v4-pro", weight: 2, timeout: 300}
-  #   model_info: {id: reasoning-go-deepseek-pro}
-  # - model_name: reasoning
-  #   litellm_params: {model: "opencode/opencode-go/kimi-k3", weight: 1, timeout: 300}
-  #   model_info: {id: reasoning-go-kimi-k3}
+      order: 1
+    model_info: {id: reasoning-gemini-flash}
+  - model_name: reasoning
+    litellm_params:
+      model: "deepseek/deepseek-flash"
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+      api_base: "https://api.deepseek.com/v1"
+      weight: 5
+      order: 2
+    model_info: {id: reasoning-deepseek-flash}
 
   # --- code: the coding subscriptions first, API spill-over second ----------
   # order 1 members are tried before order 2 (lowest healthy order wins).
-  # - model_name: code
-  #   litellm_params: {model: "opencode/opencode-go/kimi-k2.7-code", weight: 2, order: 1, timeout: 300}
-  #   model_info: {id: code-go-kimi-code}
-  # - model_name: code
-  #   litellm_params: {model: "opencode/opencode-go/qwen3.8-max", weight: 2, order: 1, timeout: 300}
-  #   model_info: {id: code-go-qwen-max}
-  # - model_name: code
-  #   litellm_params: {model: "opencode/zai-coding-plan/glm-5.3", weight: 2, order: 1, timeout: 300}
-  #   model_info: {id: code-zai-glm}
+#GO   - model_name: code
+#GO     litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 3, order: 1, timeout: 300}
+#GO     model_info: {id: code-go-deepseek-flash}
+#GO   - model_name: code
+#GO     litellm_params: {model: "opencode/opencode-go/kimi-k2.7-code", weight: 2, order: 1, timeout: 300}
+#GO     model_info: {id: code-go-kimi-code}
+#GO   - model_name: code
+#GO     litellm_params: {model: "opencode/opencode-go/qwen3.8-max", weight: 2, order: 1, timeout: 300}
+#GO     model_info: {id: code-go-qwen-max}
+#GO   - model_name: code
+#GO     litellm_params: {model: "opencode/zai-coding-plan/glm-5.3", weight: 2, order: 1, timeout: 300}
+#GO     model_info: {id: code-zai-glm}
   # - model_name: code
   #   litellm_params: {model: "claudecode/sonnet", weight: 2, order: 1, timeout: 300}
   #   model_info: {id: code-claude-sonnet}
   - model_name: code
     litellm_params:
-      model: "deepseek/deepseek-v4-pro"
-      api_key: "os.environ/DEEPSEEK_API_KEY"
-      api_base: "https://api.deepseek.com/v1"
-      weight: 3
-      order: 2
-    model_info: {id: code-deepseek-pro}
-  - model_name: code
-    litellm_params:
-      model: "gemini/gemini-pro-latest"
+      model: "gemini/gemini-flash-latest"
       api_key: "os.environ/GEMINI_API_KEY"
       weight: 3
+      order: 1
+    model_info: {id: code-gemini-flash}
+  - model_name: code
+    litellm_params:
+      model: "deepseek/deepseek-flash"
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+      api_base: "https://api.deepseek.com/v1"
+      weight: 5
       order: 2
-    model_info: {id: code-gemini-pro}
+    model_info: {id: code-deepseek-flash}
 
   # --- web: web-grounded answers (searches on every call, takes no tools) ---
   # ENABLE once PERPLEXITYAI_API_KEY is in the router Secret (the key lives in the desktop's Claude Code MCP
@@ -201,17 +219,12 @@ model_list:
       api_key: "os.environ/DEEPSEEK_API_KEY"
       api_base: "https://api.deepseek.com/v1"
     model_info: {id: pin-deepseek-flash-multimodal}
-  - model_name: deepseek-pro
-    litellm_params:
-      model: "deepseek/deepseek-v4-pro"
-      api_key: "os.environ/DEEPSEEK_API_KEY"
-      api_base: "https://api.deepseek.com/v1"
-    model_info: {id: pin-deepseek-pro}
   - model_name: gemini
     litellm_params:
       model: "gemini/gemini-flash-latest"
       api_key: "os.environ/GEMINI_API_KEY"
     model_info: {id: pin-gemini-flash}
+  # Pin-only, in NO group (Will, 2026-10-20: the Flash models are superior; this one stays for A/B only).
   - model_name: gemini-pro
     litellm_params:
       model: "gemini/gemini-pro-latest"
@@ -234,23 +247,10 @@ model_list:
         chat_template_kwargs: { enable_thinking: true, reasoning_effort: "low" }
     model_info: {id: pin-local-bonsai}
 
-  # opencode Go reached DIRECTLY by this proxy (no CLI in the path). Works (probed 2026-10-20), but Go's terms call
-  # it a product for coding agents and ask third-party clients to identify themselves; adding these to a group is
-  # Will's call. ENABLE once OPENCODE_API_KEY is in the router Secret.
-  # - model_name: go-deepseek-flash
-  #   litellm_params:
-  #     model: "openai/deepseek-v4.1-flash"
-  #     api_base: "https://opencode.ai/inference/go/openai/v1"
-  #     api_key: "os.environ/OPENCODE_API_KEY"
-  #     extra_headers: {User-Agent: "lab-litellm-router/1.0", x-opencode-session: "lab-router"}
-  #   model_info: {id: pin-go-deepseek-flash}
-  # - model_name: go-glm-flash
-  #   litellm_params:
-  #     model: "openai/glm-5.3-flash"
-  #     api_base: "https://opencode.ai/inference/go/openai/v1"
-  #     api_key: "os.environ/OPENCODE_API_KEY"
-  #     extra_headers: {User-Agent: "lab-litellm-router/1.0", x-opencode-session: "lab-router"}
-  #   model_info: {id: pin-go-glm-flash}
+  # NO direct opencode Go / Zen deployments here, ever (Will, 2026-10-20): the subscription tools (opencode Go,
+  # the Z.ai coding plan, Claude Max, Antigravity) are used only THROUGH their CLIs in the gateways; this proxy
+  # translates the lab's requests into valid requests for those tools. That is the only authorized way and it
+  # is what the plans are paid for. (Direct Go HTTP was probed working the same day and deliberately not wired.)
 
   # custom provider -> agy gateway (see handlers/agy_handler.py). Text + images (POST /files) + json-schema;
   # slow (~1 min at effort high), so it is a fallback, never a weighted member.
@@ -315,7 +315,6 @@ litellm_settings:
     # legacy single names keep a chain so a pin on a dead backend still answers
     - deepseek: ["generic"]
     - deepseek-multimodal: ["vision"]
-    - deepseek-pro: ["reasoning"]
     - opencode: ["generic-api"]
     - claude-code: ["generic-api"]
     - agy: ["generic-api"]
