@@ -34,11 +34,11 @@ every other consumer were repointed at the new address.
 
   | group | members today (weight) | waiting on |
   |---|---|---|
-  | `generic` | order 1: Gemini Flash (3) (+ the `#GO` members once enabled: Go DeepSeek Flash (5), Go GLM Flash (2), Z.ai GLM Flash (2)); order 2: DeepSeek API (5) | the opencode gateway's Go + Z.ai keys, `claudecode/sonnet` (its login) |
+  | `generic` | order 1: **Go DeepSeek-V4.1-Flash through the opencode gateway, alone** (`#GO`); order 2 (spill-over): Gemini Flash (3), Go GLM Flash (2), Z.ai GLM Flash (2), later Claude sonnet; order 3: the DeepSeek API key | the opencode gateway's Go + Z.ai keys, `claudecode/sonnet` (its login) |
   | `generic-api` | the tool-capable subset: DeepSeek Flash (5), Gemini Flash (3) | — |
   | `vision` | DeepSeek Flash (5), Gemini Flash (3); fallback `agy` | — |
-  | `reasoning` | DeepSeek Flash (5), Gemini Flash (3) — its own group so Go / Claude members can join it without touching `generic`; the Pro models were taken out the same day (Will: "the Flash models are both darn superior") | Go's models via the gateway |
-  | `code` | order 1: the coding subscriptions (gateway Go `kimi-k2.7-code`, `qwen3.8-max`, Z.ai `glm-5.3`, Claude sonnet); order 2: DeepSeek Flash, Gemini Flash | the same keys |
+  | `reasoning` | same shape: order 1 Go DeepSeek Flash; order 2 Gemini Flash, Go Kimi K3; order 3 the API key — its own group so members can differ from `generic` later; the Pro models were taken out the same day (Will: "the Flash models are both darn superior") | the same keys |
+  | `code` | order 1 Go DeepSeek Flash; order 2 the other coding subscriptions (Go `kimi-k2.7-code`, `qwen3.8-max`, Z.ai `glm-5.3`, Claude sonnet) and Gemini Flash; order 3 the API key | the same keys |
   | `web` | Perplexity `sonar` | `PERPLEXITYAI_API_KEY` |
   | `embeddings` / `embeddings-gemini` | Gemini `gemini-embedding-2` (3072 dims) | a local `embeddings-local` pod (Ollama cannot serve the EmbeddingGemma 2 GGUF) |
   | `transcription` | the lab whisper server (`openai/whisper-1` at `192.168.0.88:30880/v1`, timeout 900 s) | nothing: no cloud fallback on purpose |
@@ -73,14 +73,20 @@ every other consumer were repointed at the new address.
   gateway handler passes the deployment's model name through
   (`opencode/opencode-go/glm-5.3-flash` → `-m opencode-go/glm-5.3-flash`), so one
   gateway serves several router deployments.
-- **Order: the shim's DeepSeek before our API key.** In `generic`, `reasoning`
-  and `code`, order 1 is DeepSeek-V4.1-Flash on the Go subscription through the
-  opencode gateway (with Gemini Flash and the other subscription models beside
-  it); the paid DeepSeek API is order 2 and only takes a request while every
-  order-1 member is cooled down. The `#GO ` lines in `config.yaml` are those
-  order-1 members, ready to run; they are enabled (`sed -i 's/^\(\s*\)#GO /\1/'`
-  on both copies, re-apply) together with the gateway rollout that carries the
-  Go and Z.ai keys. Until then Gemini Flash is the only order-1 member.
+- **Order: opencode Go is the default for all calls, on DeepSeek Flash.** (Will,
+  2026-10-20.) In `generic`, `reasoning` and `code`, order 1 is
+  DeepSeek-V4.1-Flash on the Go subscription through the opencode gateway,
+  alone; order 2 is spill-over while it is cooled down (Gemini Flash, the other
+  Go / Z.ai models, later Claude sonnet); the paid DeepSeek API key is order 3
+  and last. litellm only considers the lowest healthy order. The gateway queues
+  beyond its `GW_MAX_CONCURRENT` (4) rather than erroring, so a burst raises
+  latency instead of spilling. The `#GO ` lines in `config.yaml` are the
+  gateway-backed members, ready to run; they are enabled
+  (`sed -i 's/^\(\s*\)#GO /\1/'` on both copies, re-apply) together with the
+  gateway rollout that carries the Go and Z.ai keys. Until then Gemini Flash is
+  the lowest healthy order and the API key the spill-over. `vision` and
+  `generic-api` cannot use the gateway (text-only CLI wrapper: no images, no
+  tools), so they stay on the DeepSeek API + Gemini by weight.
 - **deepseek backend.** Plain litellm `deepseek/deepseek-flash` against
   `https://api.deepseek.com/v1` — no CLI gateway in the path, so it honours
   OpenAI `response_format` (after the `json_schema` → `json_object` rewrite

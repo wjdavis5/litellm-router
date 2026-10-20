@@ -35,45 +35,47 @@ model_list:
   # =========================================================================
 
   # --- generic: plain text chat, the default for anything unrecognised ------
-  # ORDER (Will, 2026-10-20: "use the opencode shim first and foremost for all requests to deepseek before our
-  # api. That's literally why we built it"): order 1 = DeepSeek-V4.1-Flash on the opencode Go subscription through
-  # the opencode gateway (plus Gemini Flash, which keeps sharing the load, and the other subscription models);
-  # order 2 = the paid DeepSeek API, used only while every order-1 member is cooled down. litellm considers only
-  # the lowest healthy order.
+  # ORDER (Will, 2026-10-20: "Opencode go subscription should be our default for all calls. Focusing on the
+  # deepseek flash model." and "use the opencode shim first and foremost for all requests to deepseek before our
+  # api key"): order 1 = DeepSeek-V4.1-Flash on the opencode Go subscription through the opencode gateway, ALONE;
+  # order 2 = spill-over while it is cooled down: Gemini Flash and the other subscription models (Go GLM, Z.ai
+  # GLM, later Claude sonnet); order 3 = the paid DeepSeek API key, last. litellm considers only the lowest
+  # healthy order. The same shape in reasoning and code. (vision and generic-api cannot use the gateway: it is
+  # a text-only CLI wrapper, no images, no tools.)
   #
-  # The `#GO ` lines are the order-1 subscription members, written ready to run. They stay commented until the
+  # The `#GO ` lines are the gateway-backed members, written ready to run. They stay commented until the
   # opencode gateway rollout that carries OPENCODE_API_KEY + ZHIPU_API_KEY (task: enable gateway-backed members):
   # today's gateway (2.0.25, DeepSeek API key) would 502 on these model names and cool down three times a minute.
   # Enable with: sed -i 's/^\(\s*\)#GO /\1/' config.yaml (both copies), then re-apply. The model string after
   # `opencode/` is passed to the gateway as the CLI model (handlers/cli_gateway_handler.py). Z.ai's coding-plan
   # terms allow it only inside listed tools such as opencode, never behind this proxy directly.
 #GO   - model_name: generic
-#GO     litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 5, order: 1, timeout: 180}
+#GO     litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 180}
 #GO     model_info: {id: generic-go-deepseek-flash}
 #GO   - model_name: generic
-#GO     litellm_params: {model: "opencode/opencode-go/glm-5.3-flash", weight: 2, order: 1, timeout: 180}
+#GO     litellm_params: {model: "opencode/opencode-go/glm-5.3-flash", weight: 2, order: 2, timeout: 180}
 #GO     model_info: {id: generic-go-glm-flash}
 #GO   - model_name: generic
-#GO     litellm_params: {model: "opencode/zai-coding-plan/glm-5.3-flash", weight: 2, order: 1, timeout: 180}
+#GO     litellm_params: {model: "opencode/zai-coding-plan/glm-5.3-flash", weight: 2, order: 2, timeout: 180}
 #GO     model_info: {id: generic-zai-glm-flash}
   - model_name: generic
     litellm_params:
       model: "gemini/gemini-flash-latest"       # AI Studio free tier (limits unpublished; 429 -> cooldown)
       api_key: "os.environ/GEMINI_API_KEY"
       weight: 3
-      order: 1
+      order: 2
     model_info: {id: generic-gemini-flash}
   - model_name: generic
     litellm_params:
-      model: "deepseek/deepseek-flash"          # the paid DeepSeek API: spill-over once the Go path is enabled
+      model: "deepseek/deepseek-flash"          # the paid DeepSeek API key: last resort
       api_key: "os.environ/DEEPSEEK_API_KEY"
       api_base: "https://api.deepseek.com/v1"
-      weight: 5
-      order: 2
+      weight: 1
+      order: 3
     model_info: {id: generic-deepseek-api}
   # Claude Max through the claude gateway: add once its login works (CLAUDE_CODE_OAUTH_TOKEN, CommandCenter).
   # - model_name: generic
-  #   litellm_params: {model: "claudecode/sonnet", weight: 1, order: 1, timeout: 180}
+  #   litellm_params: {model: "claudecode/sonnet", weight: 1, order: 2, timeout: 180}
   #   model_info: {id: generic-claude-sonnet}
 
   # --- generic-api: the API-only members of generic (take `tools`) ----------
@@ -113,58 +115,57 @@ model_list:
   # "DeepSeek 4.1 Flash and Gemini Flash are both darn superior." So the same Flash pair as generic, kept as its
   # own group so the Go / Claude members can join reasoning without touching generic.
 #GO   - model_name: reasoning
-#GO     litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 5, order: 1, timeout: 300}
+#GO     litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 300}
 #GO     model_info: {id: reasoning-go-deepseek-flash}
 #GO   - model_name: reasoning
-#GO     litellm_params: {model: "opencode/opencode-go/kimi-k3", weight: 1, order: 1, timeout: 300}
+#GO     litellm_params: {model: "opencode/opencode-go/kimi-k3", weight: 1, order: 2, timeout: 300}
 #GO     model_info: {id: reasoning-go-kimi-k3}
   - model_name: reasoning
     litellm_params:
       model: "gemini/gemini-flash-latest"
       api_key: "os.environ/GEMINI_API_KEY"
       weight: 3
-      order: 1
+      order: 2
     model_info: {id: reasoning-gemini-flash}
   - model_name: reasoning
     litellm_params:
       model: "deepseek/deepseek-flash"
       api_key: "os.environ/DEEPSEEK_API_KEY"
       api_base: "https://api.deepseek.com/v1"
-      weight: 5
-      order: 2
+      weight: 1
+      order: 3
     model_info: {id: reasoning-deepseek-flash}
 
-  # --- code: the coding subscriptions first, API spill-over second ----------
-  # order 1 members are tried before order 2 (lowest healthy order wins).
+  # --- code: Go DeepSeek first, the other coding subscriptions + Gemini as spill-over, the API key last -------
 #GO   - model_name: code
-#GO     litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 3, order: 1, timeout: 300}
+#GO     litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 300}
 #GO     model_info: {id: code-go-deepseek-flash}
 #GO   - model_name: code
-#GO     litellm_params: {model: "opencode/opencode-go/kimi-k2.7-code", weight: 2, order: 1, timeout: 300}
+#GO     litellm_params: {model: "opencode/opencode-go/kimi-k2.7-code", weight: 2, order: 2, timeout: 300}
 #GO     model_info: {id: code-go-kimi-code}
 #GO   - model_name: code
-#GO     litellm_params: {model: "opencode/opencode-go/qwen3.8-max", weight: 2, order: 1, timeout: 300}
+#GO     litellm_params: {model: "opencode/opencode-go/qwen3.8-max", weight: 2, order: 2, timeout: 300}
 #GO     model_info: {id: code-go-qwen-max}
 #GO   - model_name: code
-#GO     litellm_params: {model: "opencode/zai-coding-plan/glm-5.3", weight: 2, order: 1, timeout: 300}
+#GO     litellm_params: {model: "opencode/zai-coding-plan/glm-5.3", weight: 2, order: 2, timeout: 300}
 #GO     model_info: {id: code-zai-glm}
   # - model_name: code
-  #   litellm_params: {model: "claudecode/sonnet", weight: 2, order: 1, timeout: 300}
+  #   litellm_params: {model: "claudecode/sonnet", weight: 2, order: 2, timeout: 300}
   #   model_info: {id: code-claude-sonnet}
   - model_name: code
     litellm_params:
       model: "gemini/gemini-flash-latest"
       api_key: "os.environ/GEMINI_API_KEY"
       weight: 3
-      order: 1
+      order: 2
     model_info: {id: code-gemini-flash}
   - model_name: code
     litellm_params:
       model: "deepseek/deepseek-flash"
       api_key: "os.environ/DEEPSEEK_API_KEY"
       api_base: "https://api.deepseek.com/v1"
-      weight: 5
-      order: 2
+      weight: 1
+      order: 3
     model_info: {id: code-deepseek-flash}
 
   # --- web: web-grounded answers (searches on every call, takes no tools) ---
