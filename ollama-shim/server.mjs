@@ -121,11 +121,21 @@ function toOllamaToolCalls(toolCalls) {
 }
 
 async function callLiteLLM(body) {
-  const resp = await fetch(`${LITELLM_BASE}/v1/chat/completions`, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${MASTER_KEY}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  let resp;
+  try {
+    resp = await fetch(`${LITELLM_BASE}/v1/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${MASTER_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (err) {
+    // litellm unreachable (connection refused / DNS / reset). This used to
+    // propagate as an unhandled rejection and kill the shim process
+    // (CommandCenter#23), which crash-coupled the shim to litellm's own
+    // OOMKills. Surface it as a clean 503 instead — the caller retries, the
+    // shim stays up.
+    return { status: 503, json: null, text: `litellm unreachable: ${err && err.message}` };
+  }
   const text = await resp.text();
   let json;
   try {
@@ -148,8 +158,9 @@ async function handleChat(req, res, body) {
 
   const { status, json, text } = await callLiteLLM(oai);
   if (status < 200 || status >= 300 || !json || !json.choices) {
+    const code = status >= 400 && status < 600 ? status : 502;
     log("chat: litellm error", status, text.slice(0, 200));
-    return send(res, 502, { error: `litellm error ${status}: ${text.slice(0, 200)}` });
+    return send(res, code, { error: `litellm error ${status}: ${text.slice(0, 200)}` });
   }
 
   const choice = json.choices[0] || {};
@@ -217,8 +228,9 @@ async function handleGenerate(req, res, body) {
 
   const { status, json, text } = await callLiteLLM(oai);
   if (status < 200 || status >= 300 || !json || !json.choices) {
+    const code = status >= 400 && status < 600 ? status : 502;
     log("generate: litellm error", status, text.slice(0, 200));
-    return send(res, 502, { error: `litellm error ${status}: ${text.slice(0, 200)}` });
+    return send(res, code, { error: `litellm error ${status}: ${text.slice(0, 200)}` });
   }
   const responseText = json.choices[0]?.message?.content ?? "";
   const created_at = new Date().toISOString();
@@ -268,11 +280,14 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === "POST" && path === "/api/chat") {
       const b = await readBody(req);
-      return handleChat(req, res, b);
+      // `await` matters (CommandCenter#23): returning the promise without
+      // awaiting it makes the surrounding try/catch unable to see a rejection,
+      // so any handler error became a process-killing unhandled rejection.
+      return await handleChat(req, res, b);
     }
     if (req.method === "POST" && path === "/api/generate") {
       const b = await readBody(req);
-      return handleGenerate(req, res, b);
+      return await handleGenerate(req, res, b);
     }
     return send(res, 404, { error: `unsupported: ${req.method} ${path}` });
   } catch (err) {
@@ -281,5 +296,11 @@ const server = http.createServer(async (req, res) => {
     else res.end();
   }
 });
+
+// Belt-and-braces (CommandCenter#23): a stray rejection must never take the
+// process down — the shim is a long-lived translator in front of a backend
+// that can fail. Log and keep serving.
+process.on("unhandledRejection", (err) => log("unhandledRejection (ignored)", err && err.message));
+process.on("uncaughtException", (err) => log("uncaughtException (ignored)", err && err.message));
 
 server.listen(PORT, "0.0.0.0", () => log(`ollama-shim listening on :${PORT} -> ${LITELLM_BASE} (model=${AGY_MODEL})`));
