@@ -50,8 +50,26 @@ def _provider_error(provider: str, model: Optional[str], message: str) -> Except
 # --------------------------------------------------------------------------
 # HTTP boundary (monkeypatched in tests)
 # --------------------------------------------------------------------------
+class GatewayHTTPError(Exception):
+    """A non-2xx from the gateway, WITH the body: the gateway states why it rejected a request (allow-list,
+    images, size) in its JSON body, and `raise_for_status()` used to throw that away, so every 400 reached the
+    router_call log as a bare "400 Bad Request" (2026-10-20, the night half of Frigate's vision requests were
+    rejected and nobody could see why)."""
+
+    def __init__(self, status: int, text: str):
+        super().__init__(f"HTTP {status} from the gateway: {text}")
+        self.status = status
+        self.text = text
+
+
+def _check_status(resp) -> None:
+    status = getattr(resp, "status_code", 200)
+    if status < 200 or status >= 300:
+        raise GatewayHTTPError(status, (getattr(resp, "text", "") or "")[:300].replace("\n", " "))
+
+
 def _post_run(base: str, token: str, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
-    """POST /run synchronously. Returns parsed JSON. Raises on non-2xx."""
+    """POST /run synchronously. Returns parsed JSON. Raises GatewayHTTPError on non-2xx."""
     import httpx
 
     resp = httpx.post(
@@ -60,12 +78,12 @@ def _post_run(base: str, token: str, payload: Dict[str, Any], timeout: float) ->
         json=payload,
         timeout=timeout,
     )
-    resp.raise_for_status()
+    _check_status(resp)
     return resp.json()
 
 
 async def _apost_run(base: str, token: str, payload: Dict[str, Any], timeout: float) -> Dict[str, Any]:
-    """POST /run asynchronously. Returns parsed JSON. Raises on non-2xx."""
+    """POST /run asynchronously. Returns parsed JSON. Raises GatewayHTTPError on non-2xx."""
     import httpx
 
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -74,7 +92,7 @@ async def _apost_run(base: str, token: str, payload: Dict[str, Any], timeout: fl
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             json=payload,
         )
-        resp.raise_for_status()
+        _check_status(resp)
         return resp.json()
 
 
@@ -132,12 +150,29 @@ def _flatten_content(content: Any, images: Optional[List[Dict[str, str]]] = None
                         "inline image is not a base64 data URL of a png/jpeg/webp/gif this gateway can attach"
                     )
                 images.append(parsed)
-                pieces.append(f"[attached image {len(images)}]")
+                pieces.append("[attached image]")
             elif url:
                 pieces.append(f"[image: {url}]")
         elif "text" in part:
             pieces.append(part.get("text", ""))
     return "\n".join(p for p in pieces if p)
+
+
+# The gateway takes at most 24 images a request (cli-gateways/src/server.js MAX_IMAGES), and Frigate's review
+# summaries send one preview frame per second of the review item with no upper cap in 0.18.1
+# (review_descriptions.py: min(by_tokens, duration * 1 fps), floor 3) — a 60 s item is 60 frames, which the
+# gateway rejected and litellm then re-sent up to six times (the 2026-10-20 router OOM). Frigate's own docs call
+# 20 frames the intended maximum, so more than that is thinned to 20 evenly spaced frames, first and last kept.
+MAX_GATEWAY_IMAGES = 20
+
+
+def _subsample(items: List[Any], limit: int) -> List[Any]:
+    n = len(items)
+    if n <= limit:
+        return items
+    if limit <= 1:
+        return items[:1]
+    return [items[round(i * (n - 1) / (limit - 1))] for i in range(limit)]
 
 
 def _json_instruction(response_format: Any) -> Optional[str]:
@@ -297,7 +332,7 @@ class CliGatewayLLM(litellm.CustomLLM):
         if isinstance(requested, str) and requested.strip():
             payload["model"] = requested
         if images:
-            payload["images"] = images
+            payload["images"] = _subsample(images, MAX_GATEWAY_IMAGES)
         return model, payload, http_timeout
 
     def _finish(self, model: Optional[str], body: Any) -> "litellm.ModelResponse":

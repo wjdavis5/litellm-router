@@ -207,8 +207,17 @@ class CliGatewayHandlerTest(unittest.TestCase):
             ],
         )
         self.assertEqual(seen["payload"]["images"], [{"mime": "image/png", "data": "AAAA"}, {"mime": "image/jpeg", "data": "BBBB"}])
-        self.assertIn("[attached image 1]", seen["payload"]["prompt"])
-        self.assertIn("[attached image 2]", seen["payload"]["prompt"])
+        self.assertEqual(seen["payload"]["prompt"].count("[attached image]"), 2)
+        # more frames than the gateway takes (Frigate: one a second, uncapped) are thinned evenly, ends kept
+        parts = [{"type": "text", "text": "summarise"}] + [
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{'A' * 4}{i:04d}"}} for i in range(60)]
+        opencode_llm.completion(model="m", messages=[{"role": "user", "content": parts}])
+        sent = seen["payload"]["images"]
+        self.assertEqual(len(sent), cgh.MAX_GATEWAY_IMAGES)
+        self.assertEqual(sent[0]["data"], "AAAA0000")
+        self.assertEqual(sent[-1]["data"], "AAAA0059")
+        self.assertEqual(cgh._subsample(list(range(5)), 5), [0, 1, 2, 3, 4])
+        self.assertEqual(cgh._subsample(list(range(7)), 3), [0, 3, 6])
         # not a base64 image data URL -> still a clear error (the router falls back)
         with self.assertRaises(_APIConnectionError):
             opencode_llm.completion(model="m", messages=[{"role": "user", "content": [

@@ -314,6 +314,10 @@ litellm_settings:
   # OTel traces stay off (the lab has Loki, no traces backend).
   callbacks: ["handlers.routing_hook.hook_instance"]
   set_verbose: false
+  # A caller's parameter a backend does not know (Hindsight sends reasoning_effort; the CLI gateways take none)
+  # is dropped instead of failing the deployment ("opencode does not support parameters: ['reasoning_effort']",
+  # 2026-10-20).
+  drop_params: true
   # Fallback chains are CAPABILITY-ordered. The CLI gateways (opencode, claude-code) take neither images nor
   # tools and raise on them, so `vision` and `generic-api` fall back only to `agy`. `cloud` is keyless/dead and
   # absent from every chain (CommandCenter#12/#23: a fallback to a dead backend took every consumer down).
