@@ -24,47 +24,77 @@ every other consumer were repointed at the new address.
 
 ## How it routes
 
-- **The router picks the model, not the caller** (2026-09-19).
-  `handlers/routing_hook.py` (a litellm pre-call hook) rewrites *every*
-  completion request to the cheapest backend that has the capability the
-  request needs, **discarding whatever model the caller named**. Cost policy
-  lives here, in one place, instead of being re-litigated in every consumer's
-  config. Callers describe what they need; the router decides what serves it.
-  - plain text → `deepseek`
-  - inline images or tools → `deepseek-multimodal`
-- **Capability, not preference, is the only thing that changes the answer.**
-  `deepseek` and `deepseek-multimodal` are the *same* DeepSeek upstream; they
-  differ only in fallback chain. The `opencode`/`claude-code` gateways are
-  text-only and raise on images/tools, so the multimodal chain falls back only
-  to `agy` — the one other backend that can upload an image or take a tool
-  schema. Putting a CLI gateway in that chain would guarantee an error, not a
-  recovery.
-- **Escape hatch: `pin:<model>`.** `"model": "pin:opencode"` reaches one
-  backend directly, bypassing the cost policy. It exists so a fallback backend
-  can be smoke-tested or A/B-compared before it is relied on; no consumer uses
-  it in normal operation.
+- **The caller names a use case; the router picks the backend and spreads the
+  load across every subscription** (2026-10-20; from 2026-09-19 to then every
+  request went to one DeepSeek route). `handlers/routing_hook.py` (a litellm
+  pre-call hook) maps the request's `model` onto a **group**, and litellm picks a
+  member of that group by weight (`simple-shuffle`), cools a failed member down
+  (30 s) and retries another (`enable_weighted_failover`) before the group's
+  fallback chain is used. The groups (`config.yaml`):
+
+  | group | members today (weight) | waiting on |
+  |---|---|---|
+  | `generic` | DeepSeek Flash (5), Gemini Flash (3) | the opencode gateway's Go + Z.ai coding-plan models (Secret keys), `claudecode/sonnet` (its login) |
+  | `generic-api` | the tool-capable subset: DeepSeek Flash (5), Gemini Flash (3) | — |
+  | `vision` | DeepSeek Flash (5), Gemini Flash (3); fallback `agy` | — |
+  | `reasoning` | DeepSeek V4 Pro (3), Gemini Pro (3) | Go's Pro / Kimi via the gateway |
+  | `code` | order 1: the coding subscriptions (gateway Go `kimi-k2.7-code`, `qwen3.8-max`, Z.ai `glm-5.3`, Claude sonnet); order 2: DeepSeek V4 Pro, Gemini Pro | the same keys |
+  | `web` | Perplexity `sonar` | `PERPLEXITYAI_API_KEY` |
+  | `embeddings` / `embeddings-gemini` | Gemini `gemini-embedding-2` (3072 dims) | a local `embeddings-local` pod (Ollama cannot serve the EmbeddingGemma 2 GGUF) |
+  | `transcription` | the lab whisper server (`openai/whisper-1` at `192.168.0.88:30880/v1`, timeout 900 s) | nothing: no cloud fallback on purpose |
+
+- **What the hook does with the name.** A group name is kept. A legacy or
+  foreign name (`deepseek`, `deepseek-multimodal`, `opencode`, `agy`,
+  `claude-code`, `gemini`, `gpt-4o`, `any`, `text-embedding-3-small`,
+  `whisper-1`, anything unknown) maps onto the group it meant
+  (`CALLER_ALIASES`) or the family default (`generic`, `embeddings`,
+  `transcription`, `rerank`). A chat request **carrying images always goes to
+  `vision`**; one carrying `tools` goes to `generic-api` unless it named a
+  tool-capable group (`reasoning`, `vision`). The CLI gateways take neither, so
+  `vision` and `generic-api` fall back only to `agy` (the one other backend that
+  uploads an image or takes a schema).
+- **Escape hatch: `pin:<deployment>`** reaches one deployment directly, on every
+  call type (`pin:opencode`, `pin:local-bonsai`, `pin:gemini-pro`,
+  `pin:embeddings-gemini`, `pin:transcription`). Smoke-testing and A/B only;
+  `log-review` is the one consumer that pins by design (`pin:gemini`).
+- **Which subscription served what.** Every request prints one `router_call`
+  JSON line (`group`, `deployment`, `provider`, `tokens`, `seconds`,
+  `caller_model`) to the pod's stdout, which alloy-pods ships to Loki; count it
+  by `deployment`. The response also carries `x-litellm-model-id`.
+- **Subscriptions that must stay behind a CLI.** opencode Go answers direct HTTP
+  (probed 2026-10-20) but its terms call it a product for coding agents, so the
+  direct `go-*` deployments are commented pin-only entries (promoting them is
+  the owner's call); the Z.ai coding plan's terms forbid proxying outright and it
+  is reachable only as `opencode/zai-coding-plan/*` through the opencode gateway;
+  Claude Max and Antigravity are CLI-only by their own terms (the claude / agy
+  gateways). The gateway handler passes the deployment's model name through
+  (`opencode/opencode-go/glm-5.3-flash` → `-m opencode-go/glm-5.3-flash`), so one
+  gateway serves several router deployments.
 - **deepseek backend.** Plain litellm `deepseek/deepseek-flash` against
-  `https://api.deepseek.com/v1` — no CLI gateway in the path, so unlike
-  `opencode` it honours OpenAI `response_format` and has no prompt-size quirk.
-  `deepseek-flash` is the canonical id for **DeepSeek-V4.1-Flash** (natively
-  multimodal); the legacy `deepseek-v4-flash` names resolve to retired models.
+  `https://api.deepseek.com/v1` — no CLI gateway in the path, so it honours
+  OpenAI `response_format` (after the `json_schema` → `json_object` rewrite
+  below) and has no prompt-size quirk. `deepseek-flash` is the canonical id for
+  **DeepSeek-V4.1-Flash** (natively multimodal); `deepseek-v4-pro` is the bigger
+  model in `reasoning`/`code`.
 - **agy backend.** `handlers/agy_handler.py` is a `litellm.CustomLLM` that
   flattens OpenAI `messages` into one prompt, uploads inline base64 images to
   the agy gateway's `POST /files`, references the stored path in the prompt,
   then calls `POST /run` and maps `agy.response` back to an OpenAI response.
+  About a minute a call at the gateway's effort `high`: a fallback, never a
+  weighted member.
 - **On-demand ollama.** When an operator pins `pin:ollama-local`, the hook POSTs
   the deployed controller's `ensure-running` endpoint to warm ollama up (one
   coalesced POST across concurrent callers); on timeout/failure it rewrites the
-  request to `deepseek`.
-- **Fallbacks.** litellm model fallbacks fan out over working backends only —
-  `deepseek → opencode → claude-code → agy`, and every other route leads with
-  `deepseek`. `cloud` is deliberately absent from every chain: it is keyless and
-  dead, and falling back to a dead backend is what turned the agy outage into a
-  total outage (CommandCenter#12/#23).
+  request to `generic`.
+- **Fallbacks** (`litellm_settings.fallbacks`) fan out over working backends
+  only. `cloud` is deliberately absent from every chain: it is keyless and dead,
+  and falling back to a dead backend is what turned the agy outage into a total
+  outage (CommandCenter#12/#23). Embeddings and transcription have no fallback
+  (one vector space; audio stays on the LAN).
 
-## Gemini (pin-only, 2026-10-10)
+## Gemini (2026-10-10; group member since 2026-10-20)
 
-`gemini` (Flash) and `gemini-pro` (Pro) call Google's Gemini API directly with `GEMINI_API_KEY` (an AI Studio key, in `.env` and the k8s Secret). They use the `*-latest` aliases so a retired model id cannot break the route. They are in **no fallback chain** and the cost policy never picks them: reach them with `"model": "pin:gemini"` or `"pin:gemini-pro"`. Anything sent to them leaves the lab for Google, so scrub transcripts and names first.
+`gemini` (Flash) and `gemini-pro` (Pro) call Google's Gemini API directly with `GEMINI_API_KEY` (an AI Studio key, in `.env` and the k8s Secret). They use the `*-latest` aliases so a retired model id cannot break the route. Flash is a weighted member of `generic`/`generic-api`/`vision`, Pro of `reasoning`/`code`, and `gemini-embedding-2` is the `embeddings` space; the single names are also pins (`pin:gemini`, `pin:gemini-pro`). Google publishes no numeric free-tier limits any more: a 429 cools the member down and the group carries on. Anything sent to them leaves the lab for Google, so scrub transcripts and names first.
 
 ## Build / run
 

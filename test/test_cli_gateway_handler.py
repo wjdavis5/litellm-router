@@ -121,6 +121,26 @@ class CliGatewayHandlerTest(unittest.TestCase):
         self.assertEqual(resp.usage.prompt_tokens, 12)
         self.assertEqual(resp.usage.total_tokens, 17)
 
+    def test_deployment_model_is_passed_to_the_gateway(self):
+        """`opencode/opencode-go/glm-5.3-flash` names the CLI model; `default` leaves it to the gateway."""
+        seen = {}
+
+        def fake_post(base, token, payload, timeout):
+            seen["payload"] = payload
+            return dict(GATEWAY_OK)
+
+        cgh._post_run = fake_post
+        opencode_llm.completion(model="opencode-go/glm-5.3-flash", messages=[{"role": "user", "content": "hi"}], timeout=5)
+        self.assertEqual(seen["payload"]["model"], "opencode-go/glm-5.3-flash")
+        opencode_llm.completion(model="opencode/opencode-go/glm-5.3-flash", messages=[{"role": "user", "content": "hi"}], timeout=5)
+        self.assertEqual(seen["payload"]["model"], "opencode-go/glm-5.3-flash")
+        opencode_llm.completion(model="opencode/default", messages=[{"role": "user", "content": "hi"}], timeout=5)
+        self.assertNotIn("model", seen["payload"])
+        opencode_llm.completion(model="default", messages=[{"role": "user", "content": "hi"}], timeout=5)
+        self.assertNotIn("model", seen["payload"])
+        claudecode_llm.completion(model="claudecode/sonnet", messages=[{"role": "user", "content": "hi"}], timeout=5)
+        self.assertEqual(seen["payload"]["model"], "sonnet")
+
     def test_base_env_override(self):
         os.environ["OPENCODE_BASE"] = "http://127.0.0.1:9999/"
         seen = {}

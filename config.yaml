@@ -1,77 +1,263 @@
-# litellm proxy config — DB-less. Fronts the DeepSeek API (primary), the agy /
-# opencode / claude-code CLI gateways, and on-demand local ollama. Loaded by the
-# container at /app/config.yaml.
+# litellm proxy config — DB-less. The lab's ONE front door for inference: every
+# consumer sends its request here with a USE-CASE group as the model name, and
+# the proxy spreads that group's traffic across the subscriptions the lab pays
+# for (DeepSeek API, Google AI Studio, opencode Go + the Z.ai coding plan through
+# the opencode gateway, Claude Max through the claude gateway, Antigravity through
+# the agy gateway, Perplexity), by weight, with cooldowns and fallbacks.
+# Loaded by the container at /app/config.yaml.
 #
-# SOURCE copy. The DEPLOYED copy is repos/k3s-cluster/litellm-router/config.yaml
-# (k3s, pve01-services) and differs in exactly one line — ollama-local's
-# api_base, which must be the desktop's real LAN IP in a k3s pod rather than
-# Docker Desktop's `host.docker.internal`. Keep the two in sync for everything
-# else; they silently drifted between 2026-09-13 and 2026-09-19, resynced here.
+# k3s copy of repos/litellm-router/config.yaml — keep the two files identical
+# (a 2026-10-17 edit that reached only the source repo went unnoticed until the
+# 2026-10-20 inventory sweep).
 #
 # Routing is steered by handlers/routing_hook.py (registered under
-# litellm_settings.callbacks): THE ROUTER PICKS THE MODEL, NOT THE CALLER. Every
-# request is rewritten to `deepseek` (text) or `deepseek-multimodal` (images /
-# tools) regardless of what the caller asked for — cost policy lives in one
-# place instead of in every consumer's config. The operator escape hatch
-# `pin:<model>` reaches one backend directly, for smoke-testing a fallback.
+# litellm_settings.callbacks): the caller names a use case, the router picks the
+# backend. Legacy names (`deepseek`, `opencode`, `agy`, ...) still work: the hook
+# maps them onto the group they used to mean. `pin:<deployment>` reaches one
+# deployment directly (smoke tests, A/B). Images always go to `vision`, tool
+# requests to a tool-capable group.
+#
+# Weights are per deployment within a group (simple-shuffle). A deployment that
+# fails cools down for `cooldown_time` and the request is retried on another
+# member (enable_weighted_failover) before the group's fallback chain is used.
+# Give every member of a group a weight, or none of them (a member without one
+# is never picked when the others have one).
+#
+# Secrets (k8s Secret litellm-router-secrets): DEEPSEEK_API_KEY, GEMINI_API_KEY,
+# AGY_TOKEN/OPENCODE_TOKEN/CLAUDECODE_TOKEN (+ *_BASE), CONTROLLER_TOKEN.
+# Pending (2026-10-20, see the commented blocks): PERPLEXITYAI_API_KEY (the `web`
+# group) and OPENCODE_API_KEY (direct Go pins).
 
 model_list:
-  # primary (2026-09-19): the DeepSeek API direct, no CLI gateway in the path.
-  # `deepseek-flash` is the canonical id for DeepSeek-V4.1-Flash — the legacy
-  # `deepseek-v4-flash` / `deepseek-v4-flash-vision-exp` names still resolve but
-  # point at retired models, so pin the canonical one. Native multimodal, so
-  # this route takes images too. Key: DEEPSEEK_API_KEY in the router Secret.
+  # =========================================================================
+  # USE-CASE GROUPS (what consumers name)
+  # =========================================================================
+
+  # --- generic: plain text chat, the default for anything unrecognised ------
+  - model_name: generic
+    litellm_params:
+      model: "deepseek/deepseek-flash"          # DeepSeek-V4.1-Flash, the cheapest capable API
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+      api_base: "https://api.deepseek.com/v1"
+      weight: 5
+    model_info: {id: generic-deepseek-api}
+  - model_name: generic
+    litellm_params:
+      model: "gemini/gemini-flash-latest"       # AI Studio free tier (limits unpublished; 429 -> cooldown)
+      api_key: "os.environ/GEMINI_API_KEY"
+      weight: 3
+    model_info: {id: generic-gemini-flash}
+  # The opencode gateway's subscription models (opencode Go: per-model monthly $ caps; Z.ai GLM coding plan,
+  # whose terms allow it only inside listed tools such as opencode, never behind this proxy directly). The model
+  # string after `opencode/` is passed to the gateway as the CLI model (handlers/cli_gateway_handler.py).
+  # ENABLE WITH THE GATEWAY ROLLOUT that carries OPENCODE_API_KEY + ZHIPU_API_KEY (2026-10-20): until then the
+  # live gateway runs 2.0.25 on DeepSeek and would error on these names.
+  # - model_name: generic
+  #   litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 2, timeout: 180}
+  #   model_info: {id: generic-go-deepseek-flash}
+  # - model_name: generic
+  #   litellm_params: {model: "opencode/opencode-go/glm-5.3-flash", weight: 1, timeout: 180}
+  #   model_info: {id: generic-go-glm-flash}
+  # - model_name: generic
+  #   litellm_params: {model: "opencode/zai-coding-plan/glm-5.3-flash", weight: 1, timeout: 180}
+  #   model_info: {id: generic-zai-glm-flash}
+  # Claude Max through the claude gateway: add once its login works (CLAUDE_CODE_OAUTH_TOKEN, CommandCenter).
+  # - model_name: generic
+  #   litellm_params: {model: "claudecode/sonnet", weight: 1, timeout: 180}
+  #   model_info: {id: generic-claude-sonnet}
+
+  # --- generic-api: the API-only members of generic (take `tools`) ----------
+  - model_name: generic-api
+    litellm_params:
+      model: "deepseek/deepseek-flash"
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+      api_base: "https://api.deepseek.com/v1"
+      weight: 5
+    model_info: {id: generic-api-deepseek}
+  - model_name: generic-api
+    litellm_params:
+      model: "gemini/gemini-flash-latest"
+      api_key: "os.environ/GEMINI_API_KEY"
+      weight: 3
+    model_info: {id: generic-api-gemini-flash}
+
+  # --- vision: requests carrying images ------------------------------------
+  # The hook declares deepseek-flash's vision capability itself (routing_hook.REQUIRED_MODEL_INFO); gemini/ and
+  # openai/ providers forward images regardless. Fallback: agy (uploads the image via POST /files).
+  - model_name: vision
+    litellm_params:
+      model: "deepseek/deepseek-flash"
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+      api_base: "https://api.deepseek.com/v1"
+      weight: 5
+    model_info: {id: vision-deepseek-api}
+  - model_name: vision
+    litellm_params:
+      model: "gemini/gemini-flash-latest"
+      api_key: "os.environ/GEMINI_API_KEY"
+      weight: 3
+    model_info: {id: vision-gemini-flash}
+
+  # --- reasoning: harder problems, bigger models ----------------------------
+  - model_name: reasoning
+    litellm_params:
+      model: "deepseek/deepseek-v4-pro"         # ~4x Flash's price, still cents per million
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+      api_base: "https://api.deepseek.com/v1"
+      weight: 3
+    model_info: {id: reasoning-deepseek-pro}
+  - model_name: reasoning
+    litellm_params:
+      model: "gemini/gemini-pro-latest"
+      api_key: "os.environ/GEMINI_API_KEY"
+      weight: 3
+    model_info: {id: reasoning-gemini-pro}
+  # - model_name: reasoning
+  #   litellm_params: {model: "opencode/opencode-go/deepseek-v4-pro", weight: 2, timeout: 300}
+  #   model_info: {id: reasoning-go-deepseek-pro}
+  # - model_name: reasoning
+  #   litellm_params: {model: "opencode/opencode-go/kimi-k3", weight: 1, timeout: 300}
+  #   model_info: {id: reasoning-go-kimi-k3}
+
+  # --- code: the coding subscriptions first, API spill-over second ----------
+  # order 1 members are tried before order 2 (lowest healthy order wins).
+  # - model_name: code
+  #   litellm_params: {model: "opencode/opencode-go/kimi-k2.7-code", weight: 2, order: 1, timeout: 300}
+  #   model_info: {id: code-go-kimi-code}
+  # - model_name: code
+  #   litellm_params: {model: "opencode/opencode-go/qwen3.8-max", weight: 2, order: 1, timeout: 300}
+  #   model_info: {id: code-go-qwen-max}
+  # - model_name: code
+  #   litellm_params: {model: "opencode/zai-coding-plan/glm-5.3", weight: 2, order: 1, timeout: 300}
+  #   model_info: {id: code-zai-glm}
+  # - model_name: code
+  #   litellm_params: {model: "claudecode/sonnet", weight: 2, order: 1, timeout: 300}
+  #   model_info: {id: code-claude-sonnet}
+  - model_name: code
+    litellm_params:
+      model: "deepseek/deepseek-v4-pro"
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+      api_base: "https://api.deepseek.com/v1"
+      weight: 3
+      order: 2
+    model_info: {id: code-deepseek-pro}
+  - model_name: code
+    litellm_params:
+      model: "gemini/gemini-pro-latest"
+      api_key: "os.environ/GEMINI_API_KEY"
+      weight: 3
+      order: 2
+    model_info: {id: code-gemini-pro}
+
+  # --- web: web-grounded answers (searches on every call, takes no tools) ---
+  # ENABLE once PERPLEXITYAI_API_KEY is in the router Secret (the key lives in the desktop's Claude Code MCP
+  # config today). Perplexity retired the Sonar chat-completions shape 2026-09-27 but still reformulates such
+  # requests into its Agent API; verify with pin:web after enabling.
+  # - model_name: web
+  #   litellm_params: {model: "perplexity/sonar", api_key: "os.environ/PERPLEXITYAI_API_KEY"}
+  #   model_info: {id: web-perplexity-sonar}
+
+  # --- embeddings: ONE vector space per group name ---------------------------
+  # Never load-share or fall back across embedding models: vectors from different models are incomparable,
+  # and a consumer that stores vectors must pin one group forever. `embeddings` = Gemini's free embedding model
+  # (3072 dims, 8k tokens; `dimensions` on the request shortens it). A local one (`embeddings-local`) is the
+  # follow-up: Ollama cannot serve the EmbeddingGemma 2 GGUF (500, probed 2026-10-20), so it needs its own pod.
+  - model_name: embeddings
+    litellm_params:
+      model: "gemini/gemini-embedding-2"
+      api_key: "os.environ/GEMINI_API_KEY"
+    model_info: {id: embeddings-gemini, mode: embedding}
+  - model_name: embeddings-gemini
+    litellm_params:
+      model: "gemini/gemini-embedding-2"
+      api_key: "os.environ/GEMINI_API_KEY"
+    model_info: {id: embeddings-gemini-explicit, mode: embedding}
+
+  # --- transcription: the lab whisper server, nothing else --------------------
+  # whisper.cpp on pve02-gpu (large-v3, Vulkan). The `whisper-1` name is ignored by that server (probed 2026-10-20
+  # with litellm's exact multipart). No cloud fallback on purpose: household audio stays on the LAN (the
+  # Speech-to-text rule in CommandCenter's CLAUDE.md). timeout 900 covers an hour-long file at ~23x real time.
+  - model_name: transcription
+    litellm_params:
+      model: "openai/whisper-1"
+      api_base: "http://192.168.0.88:30880/v1"
+      api_key: "none"
+      timeout: 900
+    model_info: {id: transcription-whisper-gpu, mode: audio_transcription}
+
+  # =========================================================================
+  # SINGLE DEPLOYMENTS (reach with pin:<name>; the legacy names also serve as
+  # the hook's aliases onto the groups above)
+  # =========================================================================
   - model_name: deepseek
     litellm_params:
       model: "deepseek/deepseek-flash"
       api_key: "os.environ/DEEPSEEK_API_KEY"
       api_base: "https://api.deepseek.com/v1"
-
-  # SAME upstream as `deepseek` — the only difference is the fallback chain
-  # below. Requests carrying inline images or tools land here, because the
-  # opencode/claude-code gateways are text-only and RAISE on that content; a
-  # multimodal request must never fall back into them. Verified live
-  # 2026-09-19: an 8x8 PNG through this path answers correctly.
+    model_info: {id: pin-deepseek-flash}
   - model_name: deepseek-multimodal
     litellm_params:
       model: "deepseek/deepseek-flash"
       api_key: "os.environ/DEEPSEEK_API_KEY"
       api_base: "https://api.deepseek.com/v1"
-
-  # Google Gemini via the AI Studio API (2026-10-10). NOT in any fallback chain and not what the cost policy picks: it is
-  # reached only by `pin:gemini` / `pin:gemini-pro`, for jobs the owner wants on Gemini (the log reviewer). The *-latest
-  # aliases track Google's current Flash / Pro so a retired model id cannot break the route; pin a dated id if a job needs
-  # the same model for weeks. The key is GEMINI_API_KEY in litellm-router/.env (vaulted) and the k8s Secret.
+    model_info: {id: pin-deepseek-flash-multimodal}
+  - model_name: deepseek-pro
+    litellm_params:
+      model: "deepseek/deepseek-v4-pro"
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+      api_base: "https://api.deepseek.com/v1"
+    model_info: {id: pin-deepseek-pro}
   - model_name: gemini
     litellm_params:
       model: "gemini/gemini-flash-latest"
       api_key: "os.environ/GEMINI_API_KEY"
+    model_info: {id: pin-gemini-flash}
   - model_name: gemini-pro
     litellm_params:
       model: "gemini/gemini-pro-latest"
       api_key: "os.environ/GEMINI_API_KEY"
+    model_info: {id: pin-gemini-pro}
 
-  # The desktop's local llama-server (the PrismML fork, Bonsai-2-27B ternary on the RTX 5090), 2026-10-10. Pin-only like the
-  # Gemini models: reached with pin:local-bonsai, falls back to `gemini` when the desktop or the server is down.
-  # Bound to the desktop's LAN address only, no auth (the lab's LAN-only rule). Needs the server started on :8095.
+  # The desktop's local llama-server (PrismML fork, Bonsai-2-27B ternary on the RTX 5090), 2026-10-10. Pin-only:
+  # reached with pin:local-bonsai, falls back to `gemini` when the desktop or the server is down. LAN address only,
+  # no auth (the lab's LAN-only rule). Needs the server started on :8095.
   - model_name: local-bonsai
     litellm_params:
       model: "openai/bonsai"
       api_base: "http://192.168.0.34:8095/v1"
       api_key: "none"
       timeout: 600
-      # Keep thinking ON but at LOW reasoning effort (2026-10-17). The model's chat template defaults reasoning_effort
-      # to 'xhigh', which reasons for thousands of tokens and exhausted the budget (the empty-content failures found
-      # 2026-10-10). The levels are low|medium|xhigh; the server's own default is now 'medium' (start-server.ps1), and
-      # callers that want it snappier send 'low' here. Earlier this was enable_thinking:false (no reasoning at all);
-      # Will wants reasoning kept, just bounded.
+      # Keep thinking ON but at LOW reasoning effort (Will, 2026-10-17). The model's own template defaults
+      # reasoning_effort to xhigh (thousands of reasoning tokens, the old empty-reply failures); `low` answers in a
+      # few hundred. Levels: low | medium | xhigh.
       extra_body:
         chat_template_kwargs: { enable_thinking: true, reasoning_effort: "low" }
+    model_info: {id: pin-local-bonsai}
 
-  # custom provider -> agy gateway (see handlers/agy_handler.py)
+  # opencode Go reached DIRECTLY by this proxy (no CLI in the path). Works (probed 2026-10-20), but Go's terms call
+  # it a product for coding agents and ask third-party clients to identify themselves; adding these to a group is
+  # Will's call. ENABLE once OPENCODE_API_KEY is in the router Secret.
+  # - model_name: go-deepseek-flash
+  #   litellm_params:
+  #     model: "openai/deepseek-v4.1-flash"
+  #     api_base: "https://opencode.ai/inference/go/openai/v1"
+  #     api_key: "os.environ/OPENCODE_API_KEY"
+  #     extra_headers: {User-Agent: "lab-litellm-router/1.0", x-opencode-session: "lab-router"}
+  #   model_info: {id: pin-go-deepseek-flash}
+  # - model_name: go-glm-flash
+  #   litellm_params:
+  #     model: "openai/glm-5.3-flash"
+  #     api_base: "https://opencode.ai/inference/go/openai/v1"
+  #     api_key: "os.environ/OPENCODE_API_KEY"
+  #     extra_headers: {User-Agent: "lab-litellm-router/1.0", x-opencode-session: "lab-router"}
+  #   model_info: {id: pin-go-glm-flash}
+
+  # custom provider -> agy gateway (see handlers/agy_handler.py). Text + images (POST /files) + json-schema;
+  # slow (~1 min at effort high), so it is a fallback, never a weighted member.
   - model_name: agy
     litellm_params:
       model: "agy/default"
+    model_info: {id: pin-agy}
 
   # on-demand local model served by ollama on the desktop host (comPlex)
   # TEMPORARILY DISABLED 2026-09-17 at Will's request — qwen3-vl:8b on the
@@ -81,23 +267,26 @@ model_list:
   # - model_name: ollama-local
   #   litellm_params:
   #     model: "ollama_chat/qwen3-vl:8b"
-  #     api_base: "http://host.docker.internal:11434"
+  #     api_base: "http://192.168.0.34:11434"
 
-  # cli-gateways (LXC 108/109): opencode + claude-code as HTTP backends
-  # (see handlers/cli_gateway_handler.py; text-only, no tools/images)
+  # cli-gateways: opencode + claude-code as HTTP backends (handlers/cli_gateway_handler.py; text-only, no
+  # tools/images). `default` = the gateway's own GW_DEFAULT_MODEL.
   - model_name: opencode
     litellm_params:
       model: "opencode/default"
+    model_info: {id: pin-opencode-default}
 
   - model_name: claude-code
     litellm_params:
       model: "claudecode/default"
+    model_info: {id: pin-claude-code-default}
 
   # optional cloud fallback — keyless is OK: unused until ANTHROPIC_API_KEY is set
   - model_name: cloud
     litellm_params:
       model: "anthropic/claude-sonnet-4-5"
       api_key: "os.environ/ANTHROPIC_API_KEY"
+    model_info: {id: pin-cloud-anthropic}
 
 litellm_settings:
   # register the CustomLLM instances for the custom providers
@@ -108,34 +297,35 @@ litellm_settings:
       custom_handler: handlers.opencode_handler.opencode_llm
     - provider: claudecode
       custom_handler: handlers.claudecode_handler.claudecode_llm
-  # OTel export + the pre-call routing hook instance
-  # `otel` (U10) exports TRACES via OTLP — but the lab logging stack is Loki
-  # (logs only, no Tempo/traces backend), so it's disabled until one exists.
-  # Re-add "otel" + set OTEL_ENDPOINT once a traces backend is deployed.
+  # The routing hook (pre-call steering, DeepSeek json_schema rewrite, the per-request `router_call` JSON line
+  # that Loki holds: count it by `deployment` to see which subscription served what).
+  # OTel traces stay off (the lab has Loki, no traces backend).
   callbacks: ["handlers.routing_hook.hook_instance"]
   set_verbose: false
-  # model-level fallbacks (2026-09-19): default is `deepseek` — the DeepSeek API
-  # direct, which replaces `opencode` (DeepSeek reached *through* a CLI gateway)
-  # as the primary; the gateways stay as fallbacks. Every chain points only at
-  # FUNCTIONAL backends. `cloud` is intentionally absent — it is keyless/dead,
-  # and a fallback to a dead backend is the bug that let the agy outage take
-  # down every consumer (CommandCenter#12/#23).
-  # Chains are CAPABILITY-ordered, not preference-ordered. `deepseek-multimodal`
-  # falls back ONLY to `agy`: it is the one other backend that can take an image
-  # (uploads via POST /files) or a tool schema (--json-schema). Adding a CLI
-  # gateway to that chain would guarantee a provider error, not a recovery.
+  # Fallback chains are CAPABILITY-ordered. The CLI gateways (opencode, claude-code) take neither images nor
+  # tools and raise on them, so `vision` and `generic-api` fall back only to `agy`. `cloud` is keyless/dead and
+  # absent from every chain (CommandCenter#12/#23: a fallback to a dead backend took every consumer down).
   fallbacks:
-    - deepseek: ["opencode", "claude-code", "agy"]
-    - deepseek-multimodal: ["agy"]
-    - opencode: ["deepseek", "claude-code", "agy"]  # "ollama-local" dropped while it's disabled, see above
-    - claude-code: ["deepseek", "agy", "opencode"]
-    - agy: ["deepseek", "opencode", "claude-code"]
+    - generic: ["opencode", "agy", "claude-code"]
+    - generic-api: ["agy"]
+    - vision: ["agy"]
+    - reasoning: ["generic-api", "agy"]
+    - code: ["reasoning", "generic"]
+    # embeddings / transcription: no fallback on purpose (one vector space; audio stays home)
+    # legacy single names keep a chain so a pin on a dead backend still answers
+    - deepseek: ["generic"]
+    - deepseek-multimodal: ["vision"]
+    - deepseek-pro: ["reasoning"]
+    - opencode: ["generic-api"]
+    - claude-code: ["generic-api"]
+    - agy: ["generic-api"]
     - local-bonsai: ["gemini"]            # desktop down or busy -> Gemini
-    # - ollama-local: ["deepseek"]  # re-add alongside the model_list entry above
+    # - ollama-local: ["generic"]  # re-add alongside the model_list entry above
   num_retries: 2
   request_timeout: 120
 
 router_settings:
+  routing_strategy: simple-shuffle        # stateless, DB-less; honours per-deployment weight/order
+  enable_weighted_failover: true          # a failed member is re-picked within the group before the fallback chain
   cooldown_time: 30
   allowed_fails: 3
-  routing_strategy: simple-shuffle

@@ -57,51 +57,67 @@ class RoutingHookTest(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         routing_hook._apost_ensure = self._orig
 
-    async def test_default_model_rewritten_to_deepseek(self):
+    async def test_foreign_model_name_lands_on_generic(self):
         hook = routing_hook.RouterHook()
         data = {"model": "gpt-4", "messages": []}
         out = await hook.async_pre_call_hook(None, FakeCache(), data, "completion")
-        self.assertEqual(out["model"], "deepseek")
+        self.assertEqual(out["model"], "generic")
+        self.assertEqual(out["metadata"]["caller_model"], "gpt-4")
 
-    async def test_no_model_defaults_to_deepseek(self):
+    async def test_no_model_defaults_to_generic(self):
         hook = routing_hook.RouterHook()
         data = {"messages": []}
         out = await hook.async_pre_call_hook(None, FakeCache(), data, "completion")
-        self.assertEqual(out["model"], "deepseek")
+        self.assertEqual(out["model"], "generic")
 
-    async def test_caller_named_model_is_overridden_by_cost_policy(self):
-        """The router picks, not the caller: naming a real backend is ignored."""
+    async def test_legacy_backend_names_map_onto_their_groups(self):
+        """The single-route era's names keep working: each means the group it used to be."""
         hook = routing_hook.RouterHook()
-        for name in ("opencode", "claude-code", "agy", "cloud", "gpt-4o"):
+        expect = {"opencode": "generic", "claude-code": "generic", "agy": "generic", "cloud": "generic",
+                  "deepseek": "generic", "DeepSeek": "generic", "deepseek-multimodal": "vision",
+                  "gemini-pro": "reasoning", "local-bonsai": "generic", "gpt-4o": "generic"}
+        for name, group in expect.items():
             data = {"model": name, "messages": []}
             out = await hook.async_pre_call_hook(None, FakeCache(), data, "completion")
-            self.assertEqual(out["model"], "deepseek", name)
+            self.assertEqual(out["model"], group, name)
 
-    async def test_image_request_routed_to_multimodal_chain(self):
+    async def test_use_case_groups_are_kept_as_named(self):
+        hook = routing_hook.RouterHook()
+        for group in ("generic", "generic-api", "reasoning", "code", "web", "vision"):
+            data = {"model": group, "messages": [{"role": "user", "content": "hi"}]}
+            out = await hook.async_pre_call_hook(None, FakeCache(), data, "completion")
+            self.assertEqual(out["model"], group, group)
+
+    async def test_image_request_always_goes_to_vision(self):
         """Images must not land on a chain that falls back into a text-only gateway."""
         hook = routing_hook.RouterHook()
-        data = {"model": "opencode", "messages": [
-            {"role": "user", "content": [
-                {"type": "text", "text": "what is this"},
-                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
-            ]},
-        ]}
-        out = await hook.async_pre_call_hook(None, FakeCache(), data, "completion")
-        self.assertEqual(out["model"], "deepseek-multimodal")
+        for name in ("opencode", "code", "generic", "whatever"):
+            data = {"model": name, "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what is this"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                ]},
+            ]}
+            out = await hook.async_pre_call_hook(None, FakeCache(), data, "completion")
+            self.assertEqual(out["model"], "vision", name)
 
-    async def test_tool_request_routed_to_multimodal_chain(self):
+    async def test_tool_request_moves_to_a_tool_capable_group(self):
         hook = routing_hook.RouterHook()
-        data = {"messages": [{"role": "user", "content": "hi"}],
-                "tools": [{"type": "function", "function": {"name": "f"}}]}
-        out = await hook.async_pre_call_hook(None, FakeCache(), data, "completion")
-        self.assertEqual(out["model"], "deepseek-multimodal")
+        tools = [{"type": "function", "function": {"name": "f"}}]
+        for name, group in {"generic": "generic-api", "code": "generic-api", "opencode": "generic-api",
+                            None: "generic-api", "reasoning": "reasoning", "vision": "vision"}.items():
+            data = {"messages": [{"role": "user", "content": "hi"}], "tools": tools}
+            if name:
+                data["model"] = name
+            out = await hook.async_pre_call_hook(None, FakeCache(), data, "completion")
+            self.assertEqual(out["model"], group, name)
 
-    async def test_plain_text_content_array_stays_on_text_chain(self):
+    async def test_plain_text_content_array_stays_generic(self):
         """A content ARRAY with no image part is still plain text."""
         hook = routing_hook.RouterHook()
         data = {"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}
         out = await hook.async_pre_call_hook(None, FakeCache(), data, "completion")
-        self.assertEqual(out["model"], "deepseek")
+        self.assertEqual(out["model"], "generic")
 
     async def test_pin_prefix_reaches_a_specific_backend(self):
         hook = routing_hook.RouterHook()
@@ -110,11 +126,11 @@ class RoutingHookTest(unittest.IsolatedAsyncioTestCase):
             out = await hook.async_pre_call_hook(None, FakeCache(), data, "completion")
             self.assertEqual(out["model"], target, target)
 
-    async def test_unknown_models_still_rewritten_to_deepseek(self):
+    async def test_unknown_models_still_rewritten_to_generic(self):
         hook = routing_hook.RouterHook()
         data = {"model": "gpt-5.6", "messages": []}
         out = await hook.async_pre_call_hook(None, FakeCache(), data, "completion")
-        self.assertEqual(out["model"], "deepseek")
+        self.assertEqual(out["model"], "generic")
 
     async def test_ensure_running_called_once_under_concurrency(self):
         counter = {"n": 0}
@@ -147,7 +163,7 @@ class RoutingHookTest(unittest.IsolatedAsyncioTestCase):
         hook = routing_hook.RouterHook()
         data = {"model": "pin:ollama-local"}
         out = await hook.async_pre_call_hook(None, FakeCache(), data, "completion")
-        self.assertEqual(out["model"], "deepseek")
+        self.assertEqual(out["model"], "generic")
 
     async def test_non_200_falls_back_to_default(self):
         async def fake_ensure(url, token, timeout):
@@ -158,9 +174,9 @@ class RoutingHookTest(unittest.IsolatedAsyncioTestCase):
         hook = routing_hook.RouterHook()
         data = {"model": "pin:ollama-local"}
         out = await hook.async_pre_call_hook(None, FakeCache(), data, "completion")
-        self.assertEqual(out["model"], "deepseek")
+        self.assertEqual(out["model"], "generic")
 
-    async def test_embeddings_call_type_unchanged(self):
+    async def test_embeddings_land_on_the_embeddings_group(self):
         called = {"n": 0}
 
         async def fake_ensure(url, token, timeout):
@@ -170,10 +186,57 @@ class RoutingHookTest(unittest.IsolatedAsyncioTestCase):
         routing_hook._apost_ensure = fake_ensure
 
         hook = routing_hook.RouterHook()
-        data = {"model": "text-embedding-3-small"}
-        out = await hook.async_pre_call_hook(None, FakeCache(), data, "embeddings")
-        self.assertEqual(out["model"], "text-embedding-3-small")  # untouched
+        for name, group in {"text-embedding-3-small": "embeddings", "embeddings": "embeddings",
+                            "embeddings-gemini": "embeddings-gemini", None: "embeddings"}.items():
+            data = {"input": "x"}
+            if name:
+                data["model"] = name
+            out = await hook.async_pre_call_hook(None, FakeCache(), data, "aembedding")
+            self.assertEqual(out["model"], group, name)
         self.assertEqual(called["n"], 0)
+
+    async def test_transcription_and_rerank_families(self):
+        hook = routing_hook.RouterHook()
+        out = await hook.async_pre_call_hook(None, FakeCache(), {"model": "whisper-1"}, "transcription")
+        self.assertEqual(out["model"], "transcription")
+        out = await hook.async_pre_call_hook(None, FakeCache(), {"model": "anything"}, "atranscription")
+        self.assertEqual(out["model"], "transcription")
+        out = await hook.async_pre_call_hook(None, FakeCache(), {"model": "rerank-x"}, "rerank")
+        self.assertEqual(out["model"], "rerank")
+
+    async def test_pin_works_on_every_family(self):
+        hook = routing_hook.RouterHook()
+        out = await hook.async_pre_call_hook(None, FakeCache(), {"model": "pin:embeddings-gemini"}, "aembedding")
+        self.assertEqual(out["model"], "embeddings-gemini")
+        out = await hook.async_pre_call_hook(None, FakeCache(), {"model": "pin:transcription"}, "transcription")
+        self.assertEqual(out["model"], "transcription")
+
+    async def test_unowned_call_types_pass_through(self):
+        hook = routing_hook.RouterHook()
+        for call_type in ("amoderation", "aspeech", "asearch", "aresponses", "anthropic_messages"):
+            data = {"model": "keep-me"}
+            out = await hook.async_pre_call_hook(None, FakeCache(), data, call_type)
+            self.assertEqual(out["model"], "keep-me", call_type)
+
+    def test_router_call_record_reads_the_standard_logging_object(self):
+        kwargs = {
+            "standard_logging_object": {"model_group": "generic", "model_id": "generic-gemini-flash",
+                                        "custom_llm_provider": "gemini", "model": "gemini-flash-latest",
+                                        "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
+                                        "response_time": 1.234},
+            "litellm_params": {"metadata": {"caller_model": "gpt-4"}},
+            "call_type": "acompletion",
+        }
+        rec = routing_hook.router_call_record(kwargs, "ok")
+        self.assertEqual(rec["router_call"], "ok")
+        self.assertEqual(rec["group"], "generic")
+        self.assertEqual(rec["deployment"], "generic-gemini-flash")
+        self.assertEqual(rec["provider"], "gemini")
+        self.assertEqual(rec["caller_model"], "gpt-4")
+        self.assertEqual(rec["tokens"], 15)
+        self.assertEqual(rec["seconds"], 1.23)
+        # never raises on garbage
+        self.assertEqual(routing_hook.router_call_record(None, "error")["router_call"], "error")
 
 
 SCHEMA = {
@@ -279,6 +342,20 @@ class DeepseekStructuredOutputTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(
                 await hook.async_pre_call_deployment_hook(kw, "acompletion"), model)
 
+    async def test_deepseek_behind_opencode_zen_is_also_translated(self):
+        """A DeepSeek model reached through opencode's Zen/Go endpoint has the same response_format rules."""
+        hook = routing_hook.RouterHook()
+        kw = _schema_kwargs(model="openai/deepseek-v4.1-flash")
+        kw["custom_llm_provider"] = "openai"
+        kw["api_base"] = "https://opencode.ai/inference/go/openai/v1"
+        out = await hook.async_pre_call_deployment_hook(kw, "acompletion")
+        self.assertIsNotNone(out)
+        self.assertEqual(out["response_format"], {"type": "json_object"})
+        kw = _schema_kwargs(model="openai/glm-5.3-flash")
+        kw["custom_llm_provider"] = "openai"
+        kw["api_base"] = "https://opencode.ai/inference/go/openai/v1"
+        self.assertIsNone(await hook.async_pre_call_deployment_hook(kw, "acompletion"))
+
     async def test_provider_flag_also_identifies_deepseek(self):
         hook = routing_hook.RouterHook()
         kw = _schema_kwargs(model="deepseek-flash")
@@ -350,7 +427,7 @@ class DeclaredCapabilitiesTests(unittest.TestCase):
         self._install()
         hook = routing_hook.RouterHook()
         out = asyncio.run(hook.async_pre_call_hook(None, None, copy.deepcopy(self.IMAGE_REQUEST), "acompletion"))
-        self.assertEqual(out["model"], routing_hook.MULTIMODAL_MODEL)
+        self.assertEqual(out["model"], routing_hook.VISION_GROUP)
         self.assertEqual(len(self.calls), 1)
         self.assertTrue(routing_hook._capabilities_declared())
         asyncio.run(hook.async_pre_call_hook(None, None, copy.deepcopy(self.IMAGE_REQUEST), "acompletion"))
@@ -361,7 +438,7 @@ class DeclaredCapabilitiesTests(unittest.TestCase):
         hook = routing_hook.RouterHook()
         out = asyncio.run(hook.async_pre_call_hook(
             None, None, {"model": "x", "messages": [{"role": "user", "content": "hi"}]}, "acompletion"))
-        self.assertEqual(out["model"], routing_hook.DEFAULT_MODEL)
+        self.assertEqual(out["model"], "generic")
         self.assertEqual(self.calls, [])
 
 

@@ -210,8 +210,16 @@ class CliGatewayLLM(litellm.CustomLLM):
         # client always times out before the typed gateway error can return.
         http_timeout = timeout + 5.0
         payload: Dict[str, Any] = {"prompt": prompt, "timeoutMs": int(timeout * 1000)}
-        # Per-request model override via extra_body (optional; the gateway's
-        # GW_DEFAULT_MODEL rules otherwise).
+        # Model selection (2026-10-20): the deployment's own model string names the CLI model the gateway must
+        # run, e.g. litellm_params.model "opencode/opencode-go/glm-5.3-flash" arrives here as
+        # "opencode-go/glm-5.3-flash" and is sent as payload.model, so one gateway serves several router
+        # deployments (one per subscription model). "default" (the historical entry) leaves the choice to the
+        # gateway's GW_DEFAULT_MODEL. A caller's extra_body.model still overrides either.
+        cli_model = model.strip() if isinstance(model, str) else ""
+        if cli_model.startswith(self.provider + "/"):   # tolerate the un-stripped "opencode/..." form
+            cli_model = cli_model[len(self.provider) + 1:]
+        if cli_model and cli_model != "default":
+            payload["model"] = cli_model
         requested = optional_params.get("model")
         if isinstance(requested, str) and requested.strip():
             payload["model"] = requested

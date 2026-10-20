@@ -1,50 +1,59 @@
 """litellm CustomLogger that steers routing before each call.
 
-**The router picks the model, not the caller** (2026-09-19). Every completion
-request is rewritten to the cheapest backend that has the capability the request
-actually needs. Callers describe *what they need*; cost policy lives here, in
-one place, instead of being re-litigated in every consumer's config.
+**The router picks the backend, the caller names the USE CASE** (2026-10-20;
+before that, 2026-09-19 to 2026-10-20, every request went to one DeepSeek
+route). Callers send a use-case group as the model name and litellm spreads
+that group's traffic across every subscription the lab pays for, by weight,
+with cooldowns and fallbacks (``config.yaml``). The groups:
 
-- plain text            -> ``deepseek``             (DeepSeek-V4.1-Flash)
-- inline images / tools -> ``deepseek-multimodal``  (same upstream, different
-                                                     fallback chain)
+- ``generic``       plain text chat: DeepSeek API, Gemini Flash, the opencode
+                    gateway's Go + Z.ai coding-plan models, ...
+- ``generic-api``   the API-only, tool-capable members of ``generic`` (the CLI
+                    gateways cannot take ``tools``); tool requests land here
+- ``vision``        requests carrying images (DeepSeek, Gemini; agy as fallback)
+- ``reasoning``     harder problems: DeepSeek V4 Pro, Gemini Pro, Go's Pro/Kimi
+- ``code``          code generation: the coding subscriptions first, API spill-over
+- ``web``           web-grounded answers (Perplexity)
+- ``embeddings``    ONE vector space per group name (never load-shared across
+                    models: vectors from different models are incomparable)
+- ``transcription`` the lab whisper server (no cloud fallback: audio stays home)
+- ``rerank``        reserved
 
-Both aliases hit the same DeepSeek API. They differ only in what they fall back
-TO: the ``opencode``/``claude-code`` CLI gateways are text-only and raise on
-images or tools, so a multimodal request must never fall back into them. Its
-chain contains only ``agy``, which uploads images via ``POST /files`` and
-supports tools through ``--json-schema``.
+A caller that names something else gets the family default (``generic`` for
+chat, ``embeddings`` for embeddings, ``transcription`` for audio), except that
+the legacy names from the single-route era (``deepseek``, ``opencode``,
+``agy``, ...) map onto the group they used to mean (``CALLER_ALIASES``), so no
+consumer had to change on the day the groups appeared. A chat request that
+carries images goes to ``vision`` whatever it named; one that carries ``tools``
+goes to ``generic-api`` unless it named a group that can take them.
 
-A caller-supplied model name is IGNORED. The one exception is the operator
-escape hatch ``pin:<model>``, which reaches a specific backend directly — that
-exists so a fallback backend can be smoke-tested or A/B-compared before it is
-relied on. Nothing in the lab uses it in normal operation.
-
+The operator escape hatch ``pin:<deployment>`` still reaches one deployment
+directly, for smoke-testing or A/B comparison, on every call type.
 ``pin:ollama-local`` additionally asks the DEPLOYED controller
 (``POST {CONTROLLER_URL}/api/services/ollama/ensure-running``) to spin ollama up
-on demand, falling back to ``deepseek`` if warm-up fails. NOTE: ``ollama-local``
-is currently commented out of ``config.yaml``'s model_list, so that pin errors
-until it is re-enabled. The machinery is kept because re-enabling is documented.
+on demand, falling back to ``generic`` if warm-up fails (``ollama-local`` is
+commented out of ``config.yaml``, so that pin errors until it is re-enabled).
 
 **Structured output on DeepSeek** (2026-10-06): the DeepSeek API accepts only
-``response_format`` ``text`` and ``json_object`` � ``json_schema`` is rejected
-with HTTP 400 "This response_format type is unavailable now", and a
-``json_object`` request whose prompt never says "json" is rejected too. Callers
-(HA's Ollama integration through ollama-shim sends ``format`` as ``json_schema``)
-must not have to know that, so ``async_pre_call_deployment_hook`` rewrites such a
-request, per deployment and only when the deployment is DeepSeek, into
-``json_object`` plus the schema stated in the prompt. It is a DEPLOYMENT hook
-rather than part of the pre-call hook on purpose: the fallback backends keep
+``response_format`` ``text`` and ``json_object``; ``json_schema`` is rejected
+with HTTP 400, and a ``json_object`` request whose prompt never says "json" is
+rejected too. ``async_pre_call_deployment_hook`` rewrites such a request, per
+deployment and only when the deployment is DeepSeek-hosted (the API, or a
+DeepSeek model reached through opencode's Zen/Go endpoint), into
+``json_object`` plus the schema stated in the prompt. Fallback deployments keep
 the original ``json_schema`` (``agy`` turns it into ``--json-schema``).
 
-Concurrency is coalesced: N simultaneous ollama requests trigger at most ONE
-ensure-running POST. The in-flight ensure is tracked as a shared awaitable
-stored in the passed DualCache under a short-lived key, guarded by an asyncio
-lock, so every concurrent caller awaits the same result.
+**Which subscription served what:** ``async_log_success_event`` /
+``async_log_failure_event`` print one JSON line per request (``router_call``)
+with the group, the deployment id, the provider, tokens and latency. The pod's
+stdout is shipped to Loki by alloy-pods, so Grafana can count calls per
+deployment with LogQL; there is no Prometheus in the lab.
 
-The controller HTTP call goes through the module-level ``_apost_ensure``
-function so tests can monkeypatch it and never touch the network. ``httpx`` is
-imported lazily inside it so this module imports cleanly without it installed.
+Concurrency of the ollama warm-up is coalesced: N simultaneous requests
+trigger at most ONE ensure-running POST (a shared awaitable in the passed
+DualCache under a short-lived key, guarded by an asyncio lock). The controller
+HTTP call goes through the module-level ``_apost_ensure`` so tests can
+monkeypatch it; ``httpx`` is imported lazily inside it.
 """
 
 from __future__ import annotations
@@ -52,6 +61,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from typing import Any, Optional
 
 from litellm.integrations.custom_logger import CustomLogger
@@ -60,25 +70,69 @@ from litellm.integrations.custom_logger import CustomLogger
 DEFAULT_CONTROLLER_URL = "http://192.168.0.34:8765"
 ENSURING_KEY = "ollama-ensuring"
 
-# call types this hook acts on; anything else (embeddings, moderation, ...) is
-# passed through untouched.
+# Call-type families this hook steers. litellm's proxy names them as in
+# ``litellm/types/utils.py`` (``CallTypesLiteral``); the transcription route
+# arrives as the sync name. Anything else (moderation, speech, search,
+# responses, messages) passes through untouched.
 _COMPLETION_CALL_TYPES = {
     "completion",
     "acompletion",
     "text_completion",
     "atext_completion",
 }
+_EMBED_CALL_TYPES = {"embedding", "aembedding"}
+_TRANSCRIBE_CALL_TYPES = {"transcription", "atranscription"}
+_RERANK_CALL_TYPES = {"rerank", "arerank"}
 
 # ollama routes, reachable only via the pin escape hatch now; naming one still
 # triggers on-demand warm-up before the request is served.
 _OLLAMA_MODELS = {"ollama-local"}
 
-# Cost policy targets. Both are the DeepSeek API; they differ only in fallback
-# chain (see the module docstring and config.yaml).
-DEFAULT_MODEL = "deepseek"
-MULTIMODAL_MODEL = "deepseek-multimodal"
+# Use-case groups, by family. A caller that names one of these keeps it.
+TEXT_GROUPS = {"generic", "generic-api", "reasoning", "code", "web"}
+VISION_GROUP = "vision"
+CHAT_GROUPS = TEXT_GROUPS | {VISION_GROUP}
+EMBED_GROUPS = {"embeddings", "embeddings-gemini", "embeddings-local"}
+STT_GROUPS = {"transcription"}
+RERANK_GROUPS = {"rerank"}
 
-# Operator escape hatch. "pin:opencode" -> opencode, bypassing the cost policy.
+# Groups whose members all take OpenAI ``tools``; a tool request that named
+# another text group is moved to ``generic-api`` (the CLI gateways raise on tools).
+TOOL_CAPABLE_GROUPS = {"generic-api", "reasoning", VISION_GROUP}
+
+DEFAULT_BY_FAMILY = {
+    "chat": "generic",
+    "embed": "embeddings",
+    "stt": "transcription",
+    "rerank": "rerank",
+}
+
+# Legacy names from the single-route era (and common foreign names), mapped onto
+# the group they meant. Compared case-insensitively.
+CALLER_ALIASES = {
+    "deepseek": "generic",
+    "deepseek-multimodal": VISION_GROUP,
+    "deepseek-chat": "generic",
+    "deepseek-reasoner": "reasoning",
+    "opencode": "generic",
+    "claude-code": "generic",
+    "agy": "generic",
+    "cloud": "generic",
+    "gemini": "generic",
+    "gemini-pro": "reasoning",
+    "local-bonsai": "generic",
+    "ollama-local": "generic",
+    "any": "generic",
+    "default": "generic",
+    "auto": "generic",
+    "chat": "generic",
+    "text": "generic",
+    "embed": "embeddings",
+    "whisper": "transcription",
+    "stt": "transcription",
+}
+
+# Operator escape hatch. "pin:opencode" -> opencode, bypassing the policy.
 PIN_PREFIX = "pin:"
 
 # Capabilities this router DEPENDS ON, declared here instead of trusted to litellm's downloaded model map.
@@ -118,7 +172,7 @@ def declare_model_capabilities() -> bool:
     """Register ``REQUIRED_MODEL_INFO`` with litellm. Returns True when litellm accepted it.
 
     Called at import (proxy start) and again from the pre-call hook if the live map has lost an entry, so a failed or
-    later-reloaded model map can never turn the multimodal route blind again. Never raises: a router that cannot
+    later-reloaded model map can never turn the vision route blind again. Never raises: a router that cannot
     declare a capability must still serve text.
     """
     try:
@@ -150,6 +204,26 @@ def _is_ollama_target(model: Any) -> bool:
     return model in _OLLAMA_MODELS or model.startswith("ollama")
 
 
+def _family(call_type: Any) -> Optional[str]:
+    if call_type in _COMPLETION_CALL_TYPES:
+        return "chat"
+    if call_type in _EMBED_CALL_TYPES:
+        return "embed"
+    if call_type in _TRANSCRIBE_CALL_TYPES:
+        return "stt"
+    if call_type in _RERANK_CALL_TYPES:
+        return "rerank"
+    return None
+
+
+_GROUPS_BY_FAMILY = {
+    "chat": CHAT_GROUPS,
+    "embed": EMBED_GROUPS,
+    "stt": STT_GROUPS,
+    "rerank": RERANK_GROUPS,
+}
+
+
 def _has_image_part(content: Any) -> bool:
     """True if an OpenAI content array carries an ``image_url`` part."""
     if not isinstance(content, (list, tuple)):
@@ -160,19 +234,10 @@ def _has_image_part(content: Any) -> bool:
     )
 
 
-def _needs_rich_capabilities(data: Any) -> bool:
-    """True if this request needs more than plain text completion.
-
-    Images and tool/function calling are exactly the things the text-only CLI
-    gateways raise on, so these requests need a fallback chain that excludes
-    them. Kept deliberately conservative: when in doubt we do NOT claim a
-    request is text-only, because guessing wrong sends an image into a backend
-    that cannot serve it.
-    """
+def _has_images(data: Any) -> bool:
+    """True if any message carries an inline image."""
     if not isinstance(data, dict):
         return False
-    if data.get("tools") or data.get("functions"):
-        return True
     messages = data.get("messages")
     if not isinstance(messages, (list, tuple)):
         return False
@@ -182,15 +247,65 @@ def _needs_rich_capabilities(data: Any) -> bool:
     )
 
 
+def _has_tools(data: Any) -> bool:
+    """True if the request asks for tool / function calling."""
+    return isinstance(data, dict) and bool(data.get("tools") or data.get("functions"))
+
+
+def _needs_rich_capabilities(data: Any) -> bool:
+    """Images or tools: exactly what the text-only CLI gateways raise on.
+
+    Kept deliberately conservative: when in doubt we do NOT claim a request is
+    text-only, because guessing wrong sends an image into a backend that cannot
+    serve it.
+    """
+    return _has_images(data) or _has_tools(data)
+
+
+def resolve_group(name: Any, family: str, data: Any = None) -> str:
+    """The use-case group a request belongs to.
+
+    1. a group name of this family is kept as named;
+    2. a legacy alias maps to the group it meant;
+    3. anything else gets the family default;
+    then, for chat only, images force ``vision`` and tools force a
+    tool-capable group (``generic-api`` unless the named group takes tools).
+    """
+    groups = _GROUPS_BY_FAMILY[family]
+    key = name.strip().lower() if isinstance(name, str) else ""
+    if key in groups:
+        group = key
+    elif key in CALLER_ALIASES and CALLER_ALIASES[key] in groups:
+        group = CALLER_ALIASES[key]
+    else:
+        group = DEFAULT_BY_FAMILY[family]
+    if family == "chat":
+        if _has_images(data):
+            group = VISION_GROUP
+        elif _has_tools(data) and group not in TOOL_CAPABLE_GROUPS:
+            group = "generic-api"
+    return group
+
+
 # ---- DeepSeek structured-output translation -------------------------------
 
 def _is_deepseek_deployment(kwargs: Any) -> bool:
-    """True if this per-deployment call goes to the DeepSeek API."""
+    """True if this per-deployment call is served by a DeepSeek model: the
+    DeepSeek API itself, or a DeepSeek model reached through opencode's Zen/Go
+    OpenAI-compatible endpoint (same upstream rules on ``response_format``)."""
     if not isinstance(kwargs, dict):
         return False
     model = kwargs.get("model")
-    return kwargs.get("custom_llm_provider") == "deepseek" or (
-        isinstance(model, str) and model.startswith("deepseek/")
+    if kwargs.get("custom_llm_provider") == "deepseek":
+        return True
+    if isinstance(model, str) and model.startswith("deepseek/"):
+        return True
+    api_base = kwargs.get("api_base") or (kwargs.get("litellm_params") or {}).get("api_base") or ""
+    return (
+        isinstance(model, str)
+        and "deepseek" in model.lower()
+        and isinstance(api_base, str)
+        and "opencode.ai" in api_base
     )
 
 
@@ -316,8 +431,53 @@ def _cache_set(cache: Any, key: str, value: Any, ttl: int) -> None:
             pass
 
 
+# ---- per-request accounting line (Loki) ------------------------------------
+
+def _dig(obj: Any, *keys: str) -> Any:
+    for key in keys:
+        if isinstance(obj, dict):
+            obj = obj.get(key)
+        else:
+            obj = getattr(obj, key, None)
+        if obj is None:
+            return None
+    return obj
+
+
+def router_call_record(kwargs: Any, status: str, start_time: Any = None, end_time: Any = None) -> dict:
+    """One flat dict per served request: which group, which deployment, which
+    provider, how many tokens, how long. Every field is best-effort; the line is
+    never allowed to raise into litellm."""
+    slo = _dig(kwargs, "standard_logging_object") or {}
+    lp = _dig(kwargs, "litellm_params") or {}
+    meta = _dig(lp, "metadata") or {}
+    model_info = _dig(lp, "model_info") or {}
+    rec = {
+        "router_call": status,
+        "group": slo.get("model_group") or meta.get("model_group"),
+        "deployment": slo.get("model_id") or model_info.get("id") or meta.get("model_id"),
+        "provider": slo.get("custom_llm_provider") or _dig(kwargs, "custom_llm_provider"),
+        "model": slo.get("model") or _dig(kwargs, "model"),
+        "api_base": slo.get("api_base") or lp.get("api_base"),
+        "caller_model": meta.get("caller_model") or slo.get("requested_model"),
+        "call_type": _dig(kwargs, "call_type"),
+        "tokens_in": slo.get("prompt_tokens"),
+        "tokens_out": slo.get("completion_tokens"),
+        "tokens": slo.get("total_tokens"),
+    }
+    try:
+        if start_time is not None and end_time is not None:
+            rec["seconds"] = round((end_time - start_time).total_seconds(), 2)
+        elif slo.get("response_time") is not None:
+            rec["seconds"] = round(float(slo["response_time"]), 2)
+    except Exception:
+        pass
+    return {k: v for k, v in rec.items() if v is not None}
+
+
 class RouterHook(CustomLogger):
-    """Pre-call routing steering with on-demand ollama warm-up."""
+    """Pre-call routing steering, DeepSeek structured-output translation,
+    on-demand ollama warm-up, and the per-request accounting line."""
 
     def __init__(self, ensure_timeout: float = 60.0, ensure_ttl: int = 30):
         super().__init__()
@@ -326,34 +486,38 @@ class RouterHook(CustomLogger):
         self._lock = asyncio.Lock()
 
     async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
-        # only steer chat/text completions; leave embeddings/etc untouched
-        if call_type not in _COMPLETION_CALL_TYPES:
+        family = _family(call_type)
+        if family is None or not isinstance(data, dict):
             return data
 
         model = data.get("model")
 
-        # Operator escape hatch: "pin:<model>" bypasses the cost policy and
-        # reaches one specific backend. For smoke-testing a fallback backend or
-        # A/B-comparing models — not used by any consumer in normal operation.
+        # Operator escape hatch: "pin:<deployment>" bypasses the policy and
+        # reaches one specific deployment, on every family. For smoke-testing a
+        # backend or A/B-comparing models; no consumer uses it in normal operation.
         if isinstance(model, str) and model.startswith(PIN_PREFIX):
             target = model[len(PIN_PREFIX):].strip()
             data["model"] = target
             if _is_ollama_target(target) and not await self._ensure_ollama(cache):
                 # warm-up failed/timed out -> serve it rather than erroring.
-                # (never "cloud", which is keyless/dead — see config.yaml)
-                data["model"] = DEFAULT_MODEL
+                data["model"] = DEFAULT_BY_FAMILY[family]
             return data
 
-        # Cost policy: the ROUTER picks the model, never the caller. Whatever
-        # the caller named is discarded; the request goes to the cheapest
-        # backend that has the capability it needs. Capability, not preference,
-        # is the only thing that changes the answer.
-        data["model"] = (
-            MULTIMODAL_MODEL if _needs_rich_capabilities(data) else DEFAULT_MODEL
-        )
+        group = resolve_group(model, family, data)
+        data["model"] = group
+        # Remember what the caller asked for, for the accounting line.
+        try:
+            meta = data.get("metadata")
+            if not isinstance(meta, dict):
+                meta = {}
+                data["metadata"] = meta
+            if isinstance(model, str) and model:
+                meta.setdefault("caller_model", model)
+        except Exception:
+            pass
         # Self-heal: if litellm's live map no longer says DeepSeek sees images (see REQUIRED_MODEL_INFO), say so
         # again before this request is transformed, instead of sending a camera frame as text.
-        if data["model"] == MULTIMODAL_MODEL and not _capabilities_declared():
+        if group == VISION_GROUP and not _capabilities_declared():
             declare_model_capabilities()
         return data
 
@@ -365,6 +529,23 @@ class RouterHook(CustomLogger):
         if not _is_deepseek_deployment(kwargs):
             return None
         return translate_response_format_for_deepseek(kwargs)
+
+    async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):
+        self._emit(router_call_record(kwargs, "ok", start_time, end_time))
+
+    async def async_log_failure_event(self, kwargs, response_obj, start_time, end_time):
+        rec = router_call_record(kwargs, "error", start_time, end_time)
+        exc = _dig(kwargs, "exception")
+        if exc is not None:
+            rec["error"] = str(exc)[:200]
+        self._emit(rec)
+
+    @staticmethod
+    def _emit(rec: dict) -> None:
+        try:
+            print(json.dumps(rec, ensure_ascii=False, default=str), flush=True)
+        except Exception:
+            pass
 
     async def _ensure_ollama(self, cache) -> bool:
         """Coalesced ensure-running: at most one POST across concurrent callers."""
