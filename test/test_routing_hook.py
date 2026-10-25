@@ -101,6 +101,22 @@ class RoutingHookTest(unittest.IsolatedAsyncioTestCase):
             out = await hook.async_pre_call_hook(None, FakeCache(), data, "completion")
             self.assertEqual(out["model"], "vision", name)
 
+    async def test_frigate_vision_is_kept_with_images_and_as_named(self):
+        """Frigate's own load-balanced image group survives the images-force-vision rule."""
+        hook = routing_hook.RouterHook()
+        image_msg = [{"role": "user", "content": [
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]}]
+        for name in ("frigate-vision", "Frigate-Vision"):
+            out = await hook.async_pre_call_hook(None, FakeCache(), {"model": name, "messages": list(image_msg)}, "completion")
+            self.assertEqual(out["model"], "frigate-vision", name)
+        out = await hook.async_pre_call_hook(None, FakeCache(), {"model": "frigate-vision", "messages": [{"role": "user", "content": "hi"}]}, "completion")
+        self.assertEqual(out["model"], "frigate-vision")
+        # Frigate's old name still means the shared vision group.
+        out = await hook.async_pre_call_hook(None, FakeCache(), {"model": "deepseek-multimodal", "messages": list(image_msg)}, "completion")
+        self.assertEqual(out["model"], "vision")
+
     async def test_tool_request_moves_to_a_tool_capable_group(self):
         hook = routing_hook.RouterHook()
         tools = [{"type": "function", "function": {"name": "f"}}]

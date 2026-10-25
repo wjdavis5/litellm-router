@@ -92,7 +92,13 @@ _OLLAMA_MODELS = {"ollama-local"}
 # Use-case groups, by family. A caller that names one of these keeps it.
 TEXT_GROUPS = {"generic", "generic-api", "reasoning", "code", "web"}
 VISION_GROUP = "vision"
-CHAT_GROUPS = TEXT_GROUPS | {VISION_GROUP}
+# Image groups a caller may name and keep. ``frigate-vision`` (2026-10-25, Will) is Frigate's own group: the same
+# image backends load-balanced by how busy each one is ("least-busy", config.yaml routing_groups), each with a cap
+# on requests in flight, instead of the Go-first tiers every other caller keeps. A Frigate burst then spreads across
+# the Go gateway, local Bonsai, Gemini Flash and the DeepSeek API rather than queuing behind the gateway.
+FRIGATE_VISION_GROUP = "frigate-vision"
+VISION_GROUPS = {VISION_GROUP, FRIGATE_VISION_GROUP}
+CHAT_GROUPS = TEXT_GROUPS | VISION_GROUPS
 EMBED_GROUPS = {"embeddings", "embeddings-gemini", "embeddings-local"}
 STT_GROUPS = {"transcription"}
 RERANK_GROUPS = {"rerank"}
@@ -270,8 +276,9 @@ def resolve_group(name: Any, family: str, data: Any = None) -> str:
     1. a group name of this family is kept as named;
     2. a legacy alias maps to the group it meant;
     3. anything else gets the family default;
-    then, for chat only, images force ``vision`` and tools force a
-    tool-capable group (``generic-api`` unless the named group takes tools).
+    then, for chat only, images force ``vision`` (unless the caller named an
+    image group, e.g. ``frigate-vision``) and tools force a tool-capable group
+    (``generic-api`` unless the named group takes tools).
     """
     groups = _GROUPS_BY_FAMILY[family]
     key = name.strip().lower() if isinstance(name, str) else ""
@@ -283,7 +290,8 @@ def resolve_group(name: Any, family: str, data: Any = None) -> str:
         group = DEFAULT_BY_FAMILY[family]
     if family == "chat":
         if _has_images(data):
-            group = VISION_GROUP
+            if group not in VISION_GROUPS:
+                group = VISION_GROUP
         elif _has_tools(data) and group not in TOOL_CAPABLE_GROUPS:
             group = "generic-api"
     return group
@@ -519,7 +527,7 @@ class RouterHook(CustomLogger):
             pass
         # Self-heal: if litellm's live map no longer says DeepSeek sees images (see REQUIRED_MODEL_INFO), say so
         # again before this request is transformed, instead of sending a camera frame as text.
-        if group == VISION_GROUP and not _capabilities_declared():
+        if group in VISION_GROUPS and not _capabilities_declared():
             declare_model_capabilities()
         return data
 

@@ -121,6 +121,47 @@ model_list:
       order: 3
     model_info: {id: vision-deepseek-api}
 
+  # --- frigate-vision: Frigate's own image group, load-balanced -------------------------------
+  # Will, 2026-10-25, after a sound-event flood of Frigate GenAI requests (~1,700/h) swamped the opencode gateway
+  # (Go-first tier, 4 concurrent) and litellm's image retries OOM-killed this proxy at 3Gi and then at 12Gi: Frigate
+  # gets its OWN group: four members at equal weight in ONE tier (no `order`), so simple-shuffle spreads Frigate's
+  # requests evenly across them (round robin in effect), while every other group keeps the Go-first tiers. Each
+  # member is capped on requests in flight (max_parallel_requests: litellm queues a request on its member's cap, so
+  # the caps bound each backend's load), and timeouts are short so a slow member fails over in a minute, not four.
+  # (litellm's per-group "least-busy" was tried first, 2026-10-25: in this version it counted nothing in flight and
+  # sent 16 of 16 burst requests to the first member.) Frigate's genai `model` names this group.
+  - model_name: frigate-vision
+    litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, timeout: 60, max_parallel_requests: 2}
+    model_info: {id: frigate-vision-go-deepseek-flash}
+  - model_name: frigate-vision
+    litellm_params:
+      model: "openai/bonsai"
+      api_base: "http://192.168.0.34:8095/v1"
+      api_key: "none"
+      weight: 1
+      timeout: 60
+      max_parallel_requests: 4
+      extra_body:
+        chat_template_kwargs: { enable_thinking: true, reasoning_effort: "low" }
+    model_info: {id: frigate-vision-local-bonsai, supports_vision: true}
+  - model_name: frigate-vision
+    litellm_params:
+      model: "gemini/gemini-flash-latest"
+      api_key: "os.environ/GEMINI_API_KEY"
+      weight: 1
+      timeout: 60
+      max_parallel_requests: 8
+    model_info: {id: frigate-vision-gemini-flash}
+  - model_name: frigate-vision
+    litellm_params:
+      model: "deepseek/deepseek-flash"
+      api_key: "os.environ/DEEPSEEK_API_KEY"
+      api_base: "https://api.deepseek.com/v1"
+      weight: 1
+      timeout: 60
+      max_parallel_requests: 8
+    model_info: {id: frigate-vision-deepseek-api}
+
   # --- reasoning: harder problems ---------------------------------------------
   # Will, 2026-10-20: "Reasoning and code should never go to those 2 old models" (DeepSeek V4 Pro, Gemini Pro):
   # "DeepSeek 4.1 Flash and Gemini Flash are both darn superior." So the same Flash pair as generic, kept as its
