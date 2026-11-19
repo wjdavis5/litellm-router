@@ -49,12 +49,12 @@ model_list:
   # Enable with: sed -i 's/^\(\s*\)#GO /\1/' config.yaml (both copies), then re-apply. The model string after
   # `opencode/` is passed to the gateway as the CLI model (handlers/cli_gateway_handler.py). Z.ai's coding-plan
   # terms allow it only inside listed tools such as opencode, never behind this proxy directly.
-  - model_name: generic
-    litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 180}
-    model_info: {id: generic-go-deepseek-flash}
-  - model_name: generic
-    litellm_params: {model: "opencode/opencode-go/glm-5.3-flash", weight: 2, order: 2, timeout: 180}
-    model_info: {id: generic-go-glm-flash}
+  #NOGO - model_name: generic
+  #NOGO   litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 180}
+  #NOGO   model_info: {id: generic-go-deepseek-flash}
+  #NOGO - model_name: generic
+  #NOGO   litellm_params: {model: "opencode/opencode-go/glm-5.3-flash", weight: 2, order: 2, timeout: 180}
+  #NOGO   model_info: {id: generic-go-glm-flash}
   - model_name: generic
     litellm_params: {model: "opencode/zai-coding-plan/glm-5.3-flash", weight: 2, order: 2, timeout: 180}
     model_info: {id: generic-zai-glm-flash}
@@ -99,9 +99,9 @@ model_list:
   # default here too (handlers/cli_gateway_handler.py sends inline data-URL images as `images`); order 2 = Gemini
   # Flash + Go qwen3.8-max; order 3 = the DeepSeek API key (the hook declares its vision capability itself,
   # routing_hook.REQUIRED_MODEL_INFO). Fallback: agy (uploads the image via POST /files).
-  - model_name: vision
-    litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 240}
-    model_info: {id: vision-go-deepseek-flash}
+  #NOGO - model_name: vision
+  #NOGO   litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 240}
+  #NOGO   model_info: {id: vision-go-deepseek-flash}
   - model_name: vision
     litellm_params:
       model: "gemini/gemini-flash-latest"
@@ -109,9 +109,9 @@ model_list:
       weight: 3
       order: 2
     model_info: {id: vision-gemini-flash}
-  - model_name: vision
-    litellm_params: {model: "opencode/opencode-go/qwen3.8-max", weight: 2, order: 2, timeout: 240}
-    model_info: {id: vision-go-qwen-max}
+  #NOGO - model_name: vision
+  #NOGO   litellm_params: {model: "opencode/opencode-go/qwen3.8-max", weight: 2, order: 2, timeout: 240}
+  #NOGO   model_info: {id: vision-go-qwen-max}
   - model_name: vision
     litellm_params:
       model: "deepseek/deepseek-flash"
@@ -130,9 +130,9 @@ model_list:
   # the caps bound each backend's load), and timeouts are short so a slow member fails over in a minute, not four.
   # (litellm's per-group "least-busy" was tried first, 2026-10-25: in this version it counted nothing in flight and
   # sent 16 of 16 burst requests to the first member.) Frigate's genai `model` names this group.
-  - model_name: frigate-vision
-    litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, timeout: 60, max_parallel_requests: 2}
-    model_info: {id: frigate-vision-go-deepseek-flash}
+  #NOGO - model_name: frigate-vision
+  #NOGO   litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, timeout: 60, max_parallel_requests: 2}
+  #NOGO   model_info: {id: frigate-vision-go-deepseek-flash}
   - model_name: frigate-vision
     litellm_params:
       model: "openai/bonsai"
@@ -166,12 +166,12 @@ model_list:
   # Will, 2026-10-20: "Reasoning and code should never go to those 2 old models" (DeepSeek V4 Pro, Gemini Pro):
   # "DeepSeek 4.1 Flash and Gemini Flash are both darn superior." So the same Flash pair as generic, kept as its
   # own group so the Go / Claude members can join reasoning without touching generic.
-  - model_name: reasoning
-    litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 300}
-    model_info: {id: reasoning-go-deepseek-flash}
-  - model_name: reasoning
-    litellm_params: {model: "opencode/opencode-go/kimi-k3", weight: 1, order: 2, timeout: 300}
-    model_info: {id: reasoning-go-kimi-k3}
+  #NOGO - model_name: reasoning
+  #NOGO   litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 300}
+  #NOGO   model_info: {id: reasoning-go-deepseek-flash}
+  #NOGO - model_name: reasoning
+  #NOGO   litellm_params: {model: "opencode/opencode-go/kimi-k3", weight: 1, order: 2, timeout: 300}
+  #NOGO   model_info: {id: reasoning-go-kimi-k3}
   - model_name: reasoning
     litellm_params:
       model: "gemini/gemini-flash-latest"
@@ -189,15 +189,15 @@ model_list:
     model_info: {id: reasoning-deepseek-flash}
 
   # --- code: Go DeepSeek first, the other coding subscriptions + Gemini as spill-over, the API key last -------
-  - model_name: code
-    litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 300}
-    model_info: {id: code-go-deepseek-flash}
-  - model_name: code
-    litellm_params: {model: "opencode/opencode-go/kimi-k2.7-code", weight: 2, order: 2, timeout: 300}
-    model_info: {id: code-go-kimi-code}
-  - model_name: code
-    litellm_params: {model: "opencode/opencode-go/qwen3.8-max", weight: 2, order: 2, timeout: 300}
-    model_info: {id: code-go-qwen-max}
+  #NOGO - model_name: code
+  #NOGO   litellm_params: {model: "opencode/opencode-go/deepseek-v4.1-flash", weight: 1, order: 1, timeout: 300}
+  #NOGO   model_info: {id: code-go-deepseek-flash}
+  #NOGO - model_name: code
+  #NOGO   litellm_params: {model: "opencode/opencode-go/kimi-k2.7-code", weight: 2, order: 2, timeout: 300}
+  #NOGO   model_info: {id: code-go-kimi-code}
+  #NOGO - model_name: code
+  #NOGO   litellm_params: {model: "opencode/opencode-go/qwen3.8-max", weight: 2, order: 2, timeout: 300}
+  #NOGO   model_info: {id: code-go-qwen-max}
   - model_name: code
     litellm_params: {model: "opencode/zai-coding-plan/glm-5.3", weight: 2, order: 2, timeout: 300}
     model_info: {id: code-zai-glm}
@@ -363,7 +363,10 @@ litellm_settings:
   # tools and raise on them, so `vision` and `generic-api` fall back only to `agy`. `cloud` is keyless/dead and
   # absent from every chain (CommandCenter#12/#23: a fallback to a dead backend took every consumer down).
   fallbacks:
-    - generic: ["opencode", "agy", "claude-code"]
+    # 2026-11-19: Go's balance ran out (HTTP 402 on every call; the opencode deployment defaults to Go too), so generic
+    # falls back to the paid DeepSeek API instead; restore the #NOGO-FALLBACK line with the #NOGO deployments.
+    #NOGO-FALLBACK     - generic: ["opencode", "agy", "claude-code"]
+    - generic: ["generic-api", "agy"]
     - generic-api: ["agy"]
     - vision: ["agy"]
     - reasoning: ["generic-api", "agy"]
