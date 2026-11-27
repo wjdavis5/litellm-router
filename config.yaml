@@ -64,7 +64,7 @@ model_list:
       api_key: "os.environ/GEMINI_API_KEY"
       weight: 3
       order: 2
-    model_info: {id: generic-gemini-flash}
+    model_info: {id: generic-gemini-flash, allowed_fails: 0, cooldown_time: 900}
   - model_name: generic
     litellm_params:
       model: "deepseek/deepseek-flash"          # the paid DeepSeek API key: last resort
@@ -91,7 +91,7 @@ model_list:
       model: "gemini/gemini-flash-latest"
       api_key: "os.environ/GEMINI_API_KEY"
       weight: 3
-    model_info: {id: generic-api-gemini-flash}
+    model_info: {id: generic-api-gemini-flash, allowed_fails: 0, cooldown_time: 900}
 
   # --- vision: requests carrying images ------------------------------------
   # Same order as the text groups since 2026-10-20 evening: the opencode gateway attaches images to the message
@@ -108,7 +108,7 @@ model_list:
       api_key: "os.environ/GEMINI_API_KEY"
       weight: 3
       order: 2
-    model_info: {id: vision-gemini-flash}
+    model_info: {id: vision-gemini-flash, allowed_fails: 0, cooldown_time: 900}
   #NOGO - model_name: vision
   #NOGO   litellm_params: {model: "opencode/opencode-go/qwen3.8-max", weight: 2, order: 2, timeout: 240}
   #NOGO   model_info: {id: vision-go-qwen-max}
@@ -143,7 +143,7 @@ model_list:
       max_parallel_requests: 4
       extra_body:
         chat_template_kwargs: { enable_thinking: true, reasoning_effort: "low" }
-    model_info: {id: frigate-vision-local-bonsai, supports_vision: true}
+    model_info: {id: frigate-vision-local-bonsai, allowed_fails: 0, cooldown_time: 300, supports_vision: true}
   - model_name: frigate-vision
     litellm_params:
       model: "gemini/gemini-flash-latest"
@@ -151,7 +151,7 @@ model_list:
       weight: 1
       timeout: 60
       max_parallel_requests: 8
-    model_info: {id: frigate-vision-gemini-flash}
+    model_info: {id: frigate-vision-gemini-flash, allowed_fails: 0, cooldown_time: 900}
   - model_name: frigate-vision
     litellm_params:
       model: "deepseek/deepseek-flash"
@@ -178,7 +178,7 @@ model_list:
       api_key: "os.environ/GEMINI_API_KEY"
       weight: 3
       order: 2
-    model_info: {id: reasoning-gemini-flash}
+    model_info: {id: reasoning-gemini-flash, allowed_fails: 0, cooldown_time: 900}
   - model_name: reasoning
     litellm_params:
       model: "deepseek/deepseek-flash"
@@ -210,7 +210,7 @@ model_list:
       api_key: "os.environ/GEMINI_API_KEY"
       weight: 3
       order: 2
-    model_info: {id: code-gemini-flash}
+    model_info: {id: code-gemini-flash, allowed_fails: 0, cooldown_time: 900}
   - model_name: code
     litellm_params:
       model: "deepseek/deepseek-flash"
@@ -383,6 +383,11 @@ litellm_settings:
   num_retries: 2
   request_timeout: 120
 
+# Out-of-credit and unreachable backends (2026-11-27): a provider that answers 402 (prepaid credits gone) is cooled
+# down by litellm >= 1.106 only; 1.100 treated it as a plain bad request and re-tried the dead Gemini key on every
+# call (438 failed calls in one day). Each Gemini member of a shared group, and Frigate's local Bonsai member, sets
+# model_info.allowed_fails: 0 + cooldown_time, so its first 401/402/404/408/429/5xx takes it out for 15 min (5 for
+# Bonsai) instead of needing more than `allowed_fails` failures inside one minute. Other 4xx never cool a deployment.
 router_settings:
   routing_strategy: simple-shuffle        # stateless, DB-less; honours per-deployment weight/order
   enable_weighted_failover: true          # a failed member is re-picked within the group before the fallback chain
